@@ -2,3 +2,7 @@ data_set/
 *.csv
 *.parquet
 *.zip
+data_set/
+*.csv
+*.parquet
+*.zip
