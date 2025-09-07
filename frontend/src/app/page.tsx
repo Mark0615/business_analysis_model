@@ -522,8 +522,6 @@ export default function Home() {
       ? 'https://business-analysis-model-backend.onrender.com'
       : 'http://127.0.0.1:8000');
 
-  console.log('API_BASE =', process.env.NEXT_PUBLIC_API_BASE_URL);
-
   /* ========== 後端分析呼叫 ========== */
   async function analyzeOnServer(input?: Row[]) { 
     const payload = { rows: (input ?? rows) };
