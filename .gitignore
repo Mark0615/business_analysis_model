@@ -6,3 +6,10 @@ data_set/
 *.csv
 *.parquet
 *.zip
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]

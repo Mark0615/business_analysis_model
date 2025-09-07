@@ -516,12 +516,20 @@ export default function Home() {
     return { d11, bf };
   }, [rows]);
 
+  const API_BASE =
+    process.env.NEXT_PUBLIC_API_BASE_URL ??
+    (process.env.NODE_ENV === 'production'
+      ? 'https://business-analysis-model-backend.onrender.com'
+      : 'http://127.0.0.1:8000');
+
+  console.log('API_BASE =', process.env.NEXT_PUBLIC_API_BASE_URL);
+
   /* ========== 後端分析呼叫 ========== */
-  async function analyzeOnServer(input?: Row[]) {
+  async function analyzeOnServer(input?: Row[]) { 
     const payload = { rows: (input ?? rows) };
     if (payload.rows.length === 0) return;
     try {
-      const res = await fetch('http://127.0.0.1:8000/analyze', {
+      const res = await fetch(`${API_BASE}/analyze`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
