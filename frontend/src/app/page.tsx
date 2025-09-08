@@ -522,18 +522,61 @@ export default function Home() {
       ? 'https://business-analysis-model-backend.onrender.com'
       : 'http://127.0.0.1:8000');
 
-  /* ========== 後端分析呼叫 ========== */
-  async function analyzeOnServer(input?: Row[]) { 
-    const payload = { rows: (input ?? rows) };
-    if (payload.rows.length === 0) return;
+  async function fetchWithRetry(url: string, opts: RequestInit = {}, tries = 4) {
+    for (let i = 0; i < tries; i++) {
+      const ctrl = new AbortController();
+      const timeout = setTimeout(() => ctrl.abort(), 45_000); // 45s：給冷啟的時間
+
+      try {
+        const res = await fetch(url, { ...opts, signal: ctrl.signal });
+        if (res.ok) return res;
+
+        // 暫時性錯誤：重試；其他直接回傳（讓上層看到實際錯誤）
+        if ([429, 500, 502, 503, 504, 522, 524].includes(res.status)) {
+          throw new Error('temporary');
+        }
+        return res;
+      } catch {
+        // 指數退避：1s → 2s → 4s → 最多 16s
+        await new Promise(r => setTimeout(r, Math.min(16_000, 2 ** i * 1000)));
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    throw new Error('backend unavailable');
+  }
+
+  async function analyzeOnServer(input?: Row[]) {
+    // 可選：把要傳給後端的欄位縮到最小，減少 payload/序列化負擔
+    const slimRows = (input ?? rows).map(r => ({
+      date: r.date,
+      customer_email: (r as any).customer_email ?? (r as any).customer_name,
+      product_name: r.product_name,
+      amount: r.amount,
+    }));
+
+    const payload = { rows: slimRows };
+    if (!payload.rows.length) return;
+
+    setServerNote('喚醒後端/分析中…（首次呼叫可能較久）');
+
     try {
-      const res = await fetch(`${API_BASE}/analyze`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+      const res = await fetchWithRetry(`${API_BASE}/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
+
+      // 若不是 2xx，丟出錯誤讓 catch 接住
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status} ${text || res.statusText}`);
+      }
+
       const data: ServerInsights = await res.json();
       setServer(data);
 
+      // ====== 你的診斷訊息邏輯：原封保留 ======
       const msgs: string[] = [];
       if (data.diagnostics?.assoc && !data.diagnostics.assoc.ok) {
         const d = data.diagnostics.assoc;
@@ -547,11 +590,12 @@ export default function Home() {
         if (r.reason === 'no_customer_key_or_too_few') msgs.push('RFM：缺少可辨識的客戶鍵（email/name）或客戶數過少（<3）。');
         if (r.reason === 'algorithm_error') msgs.push('RFM：演算法錯誤，請稍後重試。');
       }
-      setServerNote(msgs.join('  '));
+      setServerNote(msgs.join('  ') || '');
     } catch (e: any) {
-      setServerNote('呼叫後端失敗：' + e?.message);
+      setServerNote('呼叫後端失敗：' + (e?.message || 'unknown'));
     }
   }
+
 
   /* ==================== UI ==================== */
   return (

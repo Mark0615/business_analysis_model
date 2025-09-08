@@ -1,51 +1,75 @@
-# main.py — hardened API (CORS/limits/https/logging/diagnostics/timeouts)
-import os, time, uuid, logging, concurrent.futures as futures
-from typing import List, Optional, Dict, Any
+# main.py — Hardened FastAPI backend with CORS, limits, timeouts, and diagnostics
+import os, re, time, uuid, logging
+import concurrent.futures as futures
+from typing import List, Optional, Dict, Any, Tuple
+
+import numpy as np
+import pandas as pd
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import pandas as pd, numpy as np
 
-# ==== optional: load .env locally ====
+# ============== optional: load local .env for dev ==============
 try:
     from dotenv import load_dotenv  # pip install python-dotenv
     load_dotenv()
 except Exception:
     pass
 
-# ==== Settings (env vars) ====
-CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if o.strip()]
+# ========================== Settings ===========================
+CORS_ORIGINS_RAW = os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000"
+)
+
+# Starlette 的 CORSMiddleware 對萬用字元不吃 "https://*.xxx"
+# 這裡將帶 * 的項目轉成 allow_origin_regex，其它維持精確比對。
+_raw_origins = [o.strip() for o in CORS_ORIGINS_RAW.split(",") if o.strip()]
+_plain_origins = [o for o in _raw_origins if "*" not in o]
+_wildcards = [o for o in _raw_origins if "*" in o]
+if _wildcards:
+    _patterns = [re.escape(w).replace(r"\*", r"[^/]+") for w in _wildcards]
+    CORS_ORIGIN_REGEX = r"^(?:%s)$" % "|".join(_patterns)
+else:
+    CORS_ORIGIN_REGEX = None
+
 REQUEST_MAX_BYTES = int(os.getenv("REQUEST_MAX_BYTES", "10485760"))  # 10 MiB
-MAX_ROWS = int(os.getenv("MAX_ROWS", "200000"))                      # rows limit per request
-ALGO_TIMEOUT_SEC = int(os.getenv("ALGO_TIMEOUT_SEC", "15"))          # per-task timeout
+MAX_ROWS = int(os.getenv("MAX_ROWS", "200000"))                      # upper row limit
+ALGO_TIMEOUT_SEC = int(os.getenv("ALGO_TIMEOUT_SEC", "20"))          # per-task timeout
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-REQUIRE_HTTPS = os.getenv("REQUIRE_HTTPS", "0").lower() in ("1","true","yes")
+REQUIRE_HTTPS = os.getenv("REQUIRE_HTTPS", "0").lower() in ("1", "true", "yes")
 SENTRY_DSN = os.getenv("SENTRY_DSN", "")  # optional
 
-# ==== Logging / Sentry ====
+# ====================== Logging / Sentry =======================
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(message)s",
 )
+
 if SENTRY_DSN:
     try:
         import sentry_sdk  # pip install sentry-sdk
-        sentry_sdk.init(dsn=SENTRY_DSN, traces_sample_rate=0.1)
+        sentry_sdk.init(dsn=SENTRY_DSN, traces_sample_rate=0.05)
         logging.info("Sentry initialized")
     except Exception as e:
         logging.warning(f"Sentry init failed: {e}")
 
-# ==== ML imports ====
-from sklearn.cluster import KMeans
-from mlxtend.preprocessing import TransactionEncoder
-from mlxtend.frequent_patterns import apriori, association_rules
+# ================ Lazy ML imports (faster cold start) =========
+def _lazy_import_ml():
+    # 只在需要時才 import heavy 套件
+    from sklearn.cluster import KMeans
+    from mlxtend.preprocessing import TransactionEncoder
+    from mlxtend.frequent_patterns import apriori, association_rules
+    return KMeans, TransactionEncoder, apriori, association_rules
 
-# ==== App & middleware ====
+# ======================== FastAPI app ==========================
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=_plain_origins,
+    allow_origin_regex=CORS_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
@@ -53,7 +77,7 @@ app.add_middleware(
 
 START_TS = time.time()
 
-# Request ID + latency + basic error catcher
+# --------------------- middleware: request id / logging
 @app.middleware("http")
 async def request_context(request: Request, call_next):
     rid = request.headers.get("x-request-id") or str(uuid.uuid4())
@@ -61,15 +85,15 @@ async def request_context(request: Request, call_next):
     t0 = time.time()
     try:
         resp = await call_next(request)
-    except Exception as e:
-        logging.exception(f"[{rid}] Unhandled error")
+    except Exception:
+        logging.exception(f"[{rid}] unhandled error")
         return JSONResponse({"error": "internal_server_error", "rid": rid}, status_code=500)
-    dt = int((time.time() - t0) * 1000)
+    dt_ms = int((time.time() - t0) * 1000)
     resp.headers["X-Request-ID"] = rid
-    logging.info(f'[{rid}] {request.method} {request.url.path} -> {resp.status_code} in {dt}ms')
+    logging.info(f"[{rid}] {request.method} {request.url.path} -> {resp.status_code} in {dt_ms}ms")
     return resp
 
-# HTTPS enforce (behind proxy like Cloud Run / Render)
+# --------------------- middleware: HTTPS enforce
 @app.middleware("http")
 async def https_enforcer(request: Request, call_next):
     if REQUIRE_HTTPS:
@@ -78,7 +102,7 @@ async def https_enforcer(request: Request, call_next):
             return JSONResponse({"error": "https_required"}, status_code=400)
     return await call_next(request)
 
-# Security headers
+# --------------------- middleware: security headers
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     resp = await call_next(request)
@@ -89,21 +113,20 @@ async def security_headers(request: Request, call_next):
         resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
     return resp
 
-# Body size guard (413)
+# --------------------- middleware: request body size guard
 @app.middleware("http")
 async def size_guard(request: Request, call_next):
     if request.method in ("POST", "PUT", "PATCH"):
         cl = request.headers.get("content-length")
         if cl and int(cl) > REQUEST_MAX_BYTES:
-            return JSONResponse({"error":"request_too_large", "limit_bytes": REQUEST_MAX_BYTES}, status_code=413)
+            return JSONResponse({"error": "request_too_large", "limit_bytes": REQUEST_MAX_BYTES}, status_code=413)
         if not cl:
-            body = await request.body()  # Starlette caches it; downstream still can read
+            body = await request.body()  # Starlette caches it
             if len(body) > REQUEST_MAX_BYTES:
-                return JSONResponse({"error":"request_too_large", "limit_bytes": REQUEST_MAX_BYTES}, status_code=413)
-            # re-inject is not needed; request stores the body
+                return JSONResponse({"error": "request_too_large", "limit_bytes": REQUEST_MAX_BYTES}, status_code=413)
     return await call_next(request)
 
-# ==== Schemas ====
+# ======================== Schemas ==============================
 class Row(BaseModel):
     date: str
     product_name: str
@@ -117,7 +140,7 @@ class Row(BaseModel):
 class AnalyzeIn(BaseModel):
     rows: List[Row]
 
-# ==== Health ====
+# ======================== Health ===============================
 @app.get("/ping")
 def ping():
     return {"status": "ok", "uptime_sec": int(time.time() - START_TS)}
@@ -126,13 +149,21 @@ def ping():
 def healthz():
     return "ok"
 
-# ==== Helpers ====
-def _assoc_rules(df: pd.DataFrame) -> (list, Dict[str, Any]):
-    # build basket_id
+# ======================== Helpers ==============================
+def _assoc_rules(df: pd.DataFrame) -> Tuple[list, Dict[str, Any]]:
+    """Apriori + 連帶規則（帶診斷）。"""
+    try:
+        KMeans, TransactionEncoder, apriori, association_rules = _lazy_import_ml()
+    except Exception:
+        # 套件缺少時直接回診斷
+        return [], {"ok": False, "baskets_total": 0, "baskets_valid": 0, "reason": "algorithm_error"}
+
+    # 組籃子鍵
     cust_key = df.get("customer_email", pd.Series([""] * len(df))).fillna("").str.strip()
     if not (cust_key.str.len() > 0).any():
         cust_key = df.get("customer_name", pd.Series([""] * len(df))).fillna("").str.strip()
-    if df.get("order_id", pd.Series([None]*len(df))).notna().any():
+
+    if df.get("order_id", pd.Series([None] * len(df))).notna().any():
         df["basket_id"] = df["order_id"].fillna("NA").astype(str)
     else:
         df["basket_id"] = cust_key + "_" + df["date"].dt.strftime("%Y-%m-%d")
@@ -141,7 +172,7 @@ def _assoc_rules(df: pd.DataFrame) -> (list, Dict[str, Any]):
     tx_all = int(len(tx_series))
     tx = [t for t in tx_series.tolist() if len(t) >= 2]
 
-    assoc_rules = []
+    assoc_rules_out = []
     reason = None
     try:
         if len(tx) >= 5:
@@ -153,7 +184,7 @@ def _assoc_rules(df: pd.DataFrame) -> (list, Dict[str, Any]):
                 if not rules.empty:
                     rules = rules.sort_values(["lift", "confidence"], ascending=False).head(5)
                     for _, r in rules.iterrows():
-                        assoc_rules.append({
+                        assoc_rules_out.append({
                             "antecedents": sorted(list(r["antecedents"])),
                             "consequents": sorted(list(r["consequents"])),
                             "support": round(float(r["support"]), 4),
@@ -169,16 +200,28 @@ def _assoc_rules(df: pd.DataFrame) -> (list, Dict[str, Any]):
     except Exception:
         reason = "algorithm_error"
 
-    diag = {"ok": len(assoc_rules) > 0, "baskets_total": tx_all, "baskets_valid": int(len(tx)), "reason": reason}
-    return assoc_rules, diag
+    diag = {
+        "ok": len(assoc_rules_out) > 0,
+        "baskets_total": tx_all,
+        "baskets_valid": int(len(tx)),
+        "reason": reason,
+    }
+    return assoc_rules_out, diag
 
-def _rfm(df: pd.DataFrame) -> (Dict[str,float], Dict[str,int], Dict[str,float], Dict[str, list], Dict[str,Any]):
-    # customer key
+def _rfm(df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, int], Dict[str, float], Dict[str, list], Dict[str, Any]]:
+    """RFM 分群（KMeans 失敗時退回分位數），並輸出加溫名單。"""
+    try:
+        KMeans, *_ = _lazy_import_ml()
+    except Exception:
+        # 沒有 sklearn 時退回分位分群
+        KMeans = None
+
     cust_key = df.get("customer_email", pd.Series([""] * len(df))).fillna("").str.strip()
     if not (cust_key.str.len() > 0).any():
         cust_key = df.get("customer_name", pd.Series([""] * len(df))).fillna("").str.strip()
     df = df.join(cust_key.rename("customer_id"))
-    if df.get("order_id", pd.Series([None]*len(df))).notna().any():
+
+    if df.get("order_id", pd.Series([None] * len(df))).notna().any():
         df["basket_id"] = df["order_id"].fillna("NA").astype(str)
     else:
         df["basket_id"] = df["customer_id"].fillna("") + "_" + df["date"].dt.strftime("%Y-%m-%d")
@@ -190,40 +233,44 @@ def _rfm(df: pd.DataFrame) -> (Dict[str,float], Dict[str,int], Dict[str,float], 
                    monetary=("revenue", "sum"))
               .reset_index())
     cust = cust[cust["customer_id"].fillna("").str.len() > 0]
+
     customers_total = int(df["customer_id"].fillna("").str.len().gt(0).sum())
     customers_used = int(len(cust))
 
-    rfm_share = {"low":0.0,"mid":0.0,"high":0.0}
-    rfm_counts = {"low":0,"mid":0,"high":0}
-    rfm_avg_monetary = {"low":0.0,"mid":0.0,"high":0.0}
-    nurture = {"mid": [], "low": []}
+    rfm_share = {"low": 0.0, "mid": 0.0, "high": 0.0}
+    rfm_counts = {"low": 0, "mid": 0, "high": 0}
+    rfm_avg_monetary = {"low": 0.0, "mid": 0.0, "high": 0.0}
+    nurture: Dict[str, list] = {"mid": [], "low": []}
     reason = None
 
     if len(cust) >= 3:
         max_date = df["date"].max()
         cust["recency"] = (max_date - cust["last_date"]).dt.days
 
-        # 先嘗試 KMeans（標準化）
-        X = cust[["recency","orders","monetary"]]
-        X = (X - X.mean()) / (X.std(ddof=0) + 1e-9)
+        # 先試 KMeans，失敗或群數不佳再退回分位數
         use_quantile = False
-        try:
-            km = KMeans(n_clusters=3, n_init=10, random_state=42)
-            cust["segment"] = km.fit_predict(X)
-            rank = (cust.groupby("segment")["monetary"].mean().sort_values().reset_index())
-            rank["level"] = ["low","mid","high"]
-            m = dict(zip(rank["segment"], rank["level"]))
-            cust["level"] = cust["segment"].map(m)
+        if KMeans is not None:
+            try:
+                X = cust[["recency", "orders", "monetary"]]
+                X = (X - X.mean()) / (X.std(ddof=0) + 1e-9)
+                km = KMeans(n_clusters=3, n_init=10, random_state=42)
+                cust["segment"] = km.fit_predict(X)
 
-            counts = cust["segment"].value_counts()
-            # 只有在群數 <3 或某群極端過少才回退
-            if (len(counts) < 3) or (counts.min() <= 1):
+                counts = cust["segment"].value_counts()
+                if (len(counts) < 3) or (counts.min() <= 1):
+                    use_quantile = True
+                else:
+                    rank = (cust.groupby("segment")["monetary"]
+                              .mean().sort_values().reset_index())
+                    rank["level"] = ["low", "mid", "high"]
+                    m = dict(zip(rank["segment"], rank["level"]))
+                    cust["level"] = cust["segment"].map(m)
+            except Exception:
                 use_quantile = True
-        except Exception:
+        else:
             use_quantile = True
 
         if use_quantile:
-            # 用 monetary 三分位，讓三群更平均
             q1, q2 = cust["monetary"].quantile([1/3, 2/3])
             def lvl(v):
                 if v <= q1: return "low"
@@ -231,87 +278,104 @@ def _rfm(df: pd.DataFrame) -> (Dict[str,float], Dict[str,int], Dict[str,float], 
                 else: return "high"
             cust["level"] = cust["monetary"].apply(lvl)
 
-        total_rev = cust["monetary"].sum()
-        for lv in ["low","mid","high"]:
-            rfm_counts[lv] = int((cust["level"]==lv).sum())
-            avg = float(cust.loc[cust["level"]==lv,"monetary"].mean() or 0.0)
+        total_rev = float(cust["monetary"].sum())
+        for lv in ["low", "mid", "high"]:
+            rfm_counts[lv] = int((cust["level"] == lv).sum())
+            avg = float(cust.loc[cust["level"] == lv, "monetary"].mean() or 0.0)
             rfm_avg_monetary[lv] = round(avg, 2)
-            part = float(cust.loc[cust["level"]==lv,"monetary"].sum())
-            rfm_share[lv] = round(part/total_rev, 4) if total_rev>0 else 0.0
+            part = float(cust.loc[cust["level"] == lv, "monetary"].sum())
+            rfm_share[lv] = round(part / total_rev, 4) if total_rev > 0 else 0.0
 
-        # 加溫名單：以「最近沒回購且有潛力」為主；中/低兩群分開輸出
+        # 加溫名單（mid/low 各自條件）
         r_th = 45
-        m_th_mid = cust.loc[cust["level"]=="mid","monetary"].median() if (cust["level"]=="mid").any() else 0.0
-        m_th_low = cust.loc[cust["level"]=="low","monetary"].median() if (cust["level"]=="low").any() else 0.0
+        m_th_mid = cust.loc[cust["level"] == "mid", "monetary"].median() if (cust["level"] == "mid").any() else 0.0
+        m_th_low = cust.loc[cust["level"] == "low", "monetary"].median() if (cust["level"] == "low").any() else 0.0
 
         def build_list(df_seg, m_th):
-            seg = df_seg[(df_seg["recency"]>r_th) & (df_seg["monetary"]>=m_th)]
+            seg = df_seg[(df_seg["recency"] > r_th) & (df_seg["monetary"] >= m_th)]
             out = (seg.sort_values("monetary", ascending=False)
-                      .head(200)[["customer_id","last_date","orders","monetary"]]
-                      .rename(columns={"customer_id":"customer_email",
-                                       "last_date":"last_order_date",
-                                       "orders":"lifetime_orders",
-                                       "monetary":"lifetime_revenue"})
-                      .to_dict(orient="records"))
+                    .head(200)[["customer_id", "last_date", "orders", "monetary"]]
+                    .rename(columns={
+                        "customer_id": "customer_email",
+                        "last_date": "last_order_date",
+                        "orders": "lifetime_orders",
+                        "monetary": "lifetime_revenue"
+                    })
+                    .to_dict(orient="records"))
             return out
 
-        nurture["mid"] = build_list(cust[cust["level"]=="mid"], m_th_mid)
-        nurture["low"] = build_list(cust[cust["level"]=="low"], m_th_low)
+        nurture["mid"] = build_list(cust[cust["level"] == "mid"], m_th_mid)
+        nurture["low"] = build_list(cust[cust["level"] == "low"], m_th_low)
 
     else:
         reason = "no_customer_key_or_too_few"
 
-    diag = {"ok": customers_used >= 3, "customers_total": customers_total, "customers_used": customers_used, "reason": reason}
+    diag = {
+        "ok": customers_used >= 3,
+        "customers_total": customers_total,
+        "customers_used": customers_used,
+        "reason": reason
+    }
     return rfm_share, rfm_counts, rfm_avg_monetary, nurture, diag
 
-def _potential_products(df: pd.DataFrame, top5_names: set, monthly_ordered: pd.DataFrame) -> list:
+def _potential_products(df: pd.DataFrame,
+                        top5_names: set,
+                        monthly_ordered: pd.DataFrame) -> list:
+    """最後三個月營收加總、最近月 MoM > 20% 的上升產品，排除 Top5。"""
     out = []
     df["yyyymm"] = df["date"].dt.to_period("M").astype(str)
-    prod_m = (df.groupby(["product_name","yyyymm"], as_index=False)["revenue"].sum()
-                .sort_values(["product_name","yyyymm"]))
+    prod_m = (df.groupby(["product_name", "yyyymm"], as_index=False)["revenue"].sum()
+                .sort_values(["product_name", "yyyymm"]))
     if not prod_m.empty and len(monthly_ordered) >= 3:
         last3 = sorted(monthly_ordered["yyyymm"].unique())[-3:]
         recent = prod_m[prod_m["yyyymm"].isin(last3)]
         if not recent.empty:
             g = recent.pivot(index="product_name", columns="yyyymm", values="revenue").fillna(0.0)
             if g.shape[1] == 3:
-                g["mom_last"] = (g.iloc[:,2] - g.iloc[:,1]) / (g.iloc[:,1].replace(0, np.nan))
+                # 最後一個月相對倒數第二個月
+                g["mom_last"] = (g.iloc[:, 2] - g.iloc[:, 1]) / (g.iloc[:, 1].replace(0, np.nan))
                 g["sum3"] = g.sum(axis=1)
                 cand = g[(g["mom_last"] > 0.2) & (~g.index.isin(top5_names))]
-                cand = cand.sort_values(["mom_last","sum3"], ascending=False).head(5)
+                cand = cand.sort_values(["mom_last", "sum3"], ascending=False).head(5)
                 for name, row in cand.iterrows():
-                    out.append({"product_name": name,
-                                "mom_last": round(float(row["mom_last"]), 3),
-                                "sum3_revenue": round(float(row["sum3"]), 2)})
+                    out.append({
+                        "product_name": name,
+                        "mom_last": round(float(row["mom_last"]), 3),
+                        "sum3_revenue": round(float(row["sum3"]), 2)
+                    })
     return out
 
-# ==== API ====
+# ========================= API ================================
 @app.post("/analyze")
 async def analyze(payload: AnalyzeIn, request: Request):
     rid = getattr(request.state, "rid", "-")
 
-    # Row count guard
+    # Guard: row count
     n = len(payload.rows or [])
     if n == 0:
-        return {"error":"no_rows", "diagnostics":{"required":{"ok":False,"reason":"empty_payload"}}}
+        return {"error": "no_rows",
+                "diagnostics": {"required": {"ok": False, "reason": "empty_payload"}}}
     if n > MAX_ROWS:
-        raise HTTPException(status_code=422, detail={"error":"too_many_rows","max_rows":MAX_ROWS,"got":n})
+        raise HTTPException(status_code=422, detail={"error": "too_many_rows", "max_rows": MAX_ROWS, "got": n})
 
-    # Build DataFrame + basic clean
+    # Build DataFrame + clean
     df = pd.DataFrame([r.dict() for r in payload.rows])
-    required_cols = ["date","product_name","revenue"]
+
+    # Required fields
+    required_cols = ["date", "product_name", "revenue"]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
-        return {"error":"missing_required_fields",
-                "diagnostics":{"required":{"ok":False,"reason":"missing_fields","missing":missing}}}
+        return {"error": "missing_required_fields",
+                "diagnostics": {"required": {"ok": False, "reason": "missing_fields", "missing": missing}}}
 
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date","product_name"])
-    df["quantity"] = pd.to_numeric(df.get("quantity",0), errors="coerce").fillna(0)
-    df["revenue"]  = pd.to_numeric(df["revenue"], errors="coerce").fillna(0.0)
+    df["product_name"] = df["product_name"].astype(str).str.strip()
+    df["quantity"] = pd.to_numeric(df.get("quantity", 0), errors="coerce").fillna(0)
+    df["revenue"] = pd.to_numeric(df["revenue"], errors="coerce").fillna(0.0)
+    df = df.dropna(subset=["date", "product_name"])
     if df.empty:
-        return {"error":"invalid_required_values",
-                "diagnostics":{"required":{"ok":False,"reason":"all_rows_invalid"}}}
+        return {"error": "invalid_required_values",
+                "diagnostics": {"required": {"ok": False, "reason": "all_rows_invalid"}}}
 
     # Top5 / Monthly / MoM / WoW
     top5_df = (df.groupby("product_name", as_index=False)["revenue"].sum()
@@ -321,6 +385,7 @@ async def analyze(payload: AnalyzeIn, request: Request):
     monthly_df = (df.assign(yyyymm=df["date"].dt.strftime("%Y-%m"))
                     .groupby("yyyymm", as_index=False)["revenue"].sum()
                     .sort_values("yyyymm"))
+
     mom = None
     if len(monthly_df) >= 2:
         a, b = monthly_df.iloc[-2]["revenue"], monthly_df.iloc[-1]["revenue"]
@@ -331,49 +396,52 @@ async def analyze(payload: AnalyzeIn, request: Request):
     r2 = df.loc[(df["date"] >= last_day - pd.Timedelta(days=6)) & (df["date"] <= last_day), "revenue"].sum()
     wow = None if r1 == 0 else (r2 - r1) / r1
 
-    # Run assoc + rfm with timeouts
-    assoc_rules, assoc_diag = [], {"ok":False,"reason":"timeout","baskets_total":0,"baskets_valid":0}
-    rfm_share = {"low":0.0,"mid":0.0,"high":0.0}
-    rfm_counts = {"low":0,"mid":0,"high":0}
-    rfm_avg_monetary = {"low":0.0,"mid":0.0,"high":0.0}
-    nurture_list = []
+    # Assoc + RFM with timeouts（並行）
+    assoc_rules, assoc_diag = [], {"ok": False, "reason": "timeout", "baskets_total": 0, "baskets_valid": 0}
+    rfm_share = {"low": 0.0, "mid": 0.0, "high": 0.0}
+    rfm_counts = {"low": 0, "mid": 0, "high": 0}
+    rfm_avg_monetary = {"low": 0.0, "mid": 0.0, "high": 0.0}
+    nurture_mid: list = []
+    nurture_low: list = []
+    rfm_diag = {"ok": False, "reason": "timeout", "customers_total": 0, "customers_used": 0}
+
     with futures.ThreadPoolExecutor(max_workers=2) as ex:
         f_assoc = ex.submit(_assoc_rules, df.copy())
         f_rfm   = ex.submit(_rfm, df.copy())
+
         try:
             assoc_rules, assoc_diag = f_assoc.result(timeout=ALGO_TIMEOUT_SEC)
         except futures.TimeoutError:
-            assoc_diag = {"ok":False,"reason":"timeout","baskets_total":0,"baskets_valid":0}
+            assoc_diag = {"ok": False, "reason": "timeout", "baskets_total": 0, "baskets_valid": 0}
             logging.warning(f"[{rid}] assoc timeout")
+
         try:
-            rfm_share, rfm_counts, rfm_avg_monetary, nurture_list, rfm_diag = f_rfm.result(timeout=ALGO_TIMEOUT_SEC)
+            rfm_share, rfm_counts, rfm_avg_monetary, nurture_dict, rfm_diag = f_rfm.result(timeout=ALGO_TIMEOUT_SEC)
+            nurture_mid = nurture_dict.get("mid", [])
+            nurture_low = nurture_dict.get("low", [])
         except futures.TimeoutError:
-            rfm_diag = {"ok":False,"reason":"timeout","customers_total":0,"customers_used":0}
+            rfm_diag = {"ok": False, "reason": "timeout", "customers_total": 0, "customers_used": 0}
             logging.warning(f"[{rid}] rfm timeout")
 
     potential_products = _potential_products(df.copy(), set(top5_df["product_name"].tolist()), monthly_df)
 
-    # rfm_* 在上面
-    nurture_mid = nurture_low = []
-    try:
-        rfm_share, rfm_counts, rfm_avg_monetary, nurture_dict, rfm_diag = f_rfm.result(timeout=ALGO_TIMEOUT_SEC)
-        nurture_mid = nurture_dict.get("mid", [])
-        nurture_low = nurture_dict.get("low", [])
-    except futures.TimeoutError:
-        rfm_diag = {"ok":False,"reason":"timeout","customers_total":0,"customers_used":0}
-        logging.warning(f"[{rid}] rfm timeout")
-
     return {
         "top5_products": top5,
         "monthly": monthly_df.to_dict(orient="records"),
-        "mom": mom, "wow": wow,
+        "mom": mom,
+        "wow": wow,
         "assoc_rules": assoc_rules,
         "rfm_share": rfm_share,
         "rfm_counts": rfm_counts,
         "rfm_avg_monetary": rfm_avg_monetary,
-        "nurture_list": (nurture_mid + nurture_low),   # 向下相容
+        "nurture_list": (nurture_mid + nurture_low),  # 舊前端相容
         "nurture_mid": nurture_mid,
         "nurture_low": nurture_low,
         "potential_products": potential_products,
         "diagnostics": {"assoc": assoc_diag, "rfm": rfm_diag, "required": {"ok": True}},
     }
+
+# 可本機測試時啟動（Render/Cloud Run 不需要）
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run("main:app", host="0.0.0.0", port=8000, log_level="info")
