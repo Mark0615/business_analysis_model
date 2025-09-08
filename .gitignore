@@ -13,3 +13,9 @@ data_set/
 # Python
 __pycache__/
 *.py[cod]
+.DS_Store
+*.csv
+*.parquet
+*.zip
+.env*
+frontend/.next/
