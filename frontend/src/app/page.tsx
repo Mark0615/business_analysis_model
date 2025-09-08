@@ -212,6 +212,8 @@ export default function Home() {
   const [fileName, setFileName] = useState<string>('');
   const [notice, setNotice]   = useState<{level:'error'|'warn'|'ok'; msg:string} | null>(null);
   const [server, setServer]   = useState<ServerInsights | null>(null);
+  const [assocD11, setAssocD11] = useState<AssocRule[] | null>(null);
+  const [assoc618, setAssoc618] = useState<AssocRule[] | null>(null);
   const [serverNote, setServerNote] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('summary');
 
@@ -282,6 +284,31 @@ export default function Home() {
       map.set(yyyymm, { revenue: cur.revenue + r.revenue, orders: cur.orders + 1 });
     }
     return [...map.entries()].sort(([a],[b])=>a.localeCompare(b)).map(([yyyymm,v])=>({ yyyymm, ...v }));
+  }, [rows]);
+
+  useEffect(() => {
+    if (!rows.length) { setAssocD11(null); setAssoc618(null); return; }
+
+    const y = getLastYearKeyDate();
+    const wD11 = double11Window(y);
+    const w618 = six18Window(y);
+
+    // 兩個並行抓
+    (async () => {
+      try {
+        const [r1, r2] = await Promise.all([
+          fetchAssocForWindow(rows, wD11),
+          fetchAssocForWindow(rows, w618),
+        ]);
+        setAssocD11(r1);
+        setAssoc618(r2);
+      } catch (e: any) {
+        // 失敗就清空；不影響頁面其它區塊
+        setAssocD11([]);
+        setAssoc618([]);
+        console.error('assoc_window failed:', e?.message || e);
+      }
+    })();
   }, [rows]);
 
   const monthly12 = useMemo(() => {
@@ -480,7 +507,7 @@ export default function Home() {
     return Math.min(240, Math.max(110, Math.ceil(maxLen * 8.5)));
   }, [cityTop10]);
 
-  /* ========== 檔期名單：去年雙11 / 去年黑五 ========== */
+  /* ========== 檔期名單：去年雙11 / 去年黑五 / 618========== */
   function getLastYearKeyDate() {
     if (!rows.length) return new Date();
     const last = rows.map(r=>parseISO(r.date)).sort((a,b)=>b.getTime()-a.getTime())[0];
@@ -488,8 +515,8 @@ export default function Home() {
     return y;
   }
   function double11Window(year: number) {
-    const s = startOfDay(new Date(year, 10, 10));
-    const e = endOfDay(new Date(year, 10, 12));
+    const s = startOfDay(new Date(year, 10, 1));
+    const e = endOfDay(new Date(year, 10, 15));
     return { s, e };
   }
   function blackFridayWindow(year: number) {
@@ -500,7 +527,14 @@ export default function Home() {
     const s = startOfDay(friday4th);
     const e = endOfDay(new Date(friday4th.getFullYear(), friday4th.getMonth(), friday4th.getDate()+3));
     return { s, e };
-  }
+  }  
+
+  function six18Window(year: number) {
+    const s = startOfDay(new Date(year, 5, 1));
+    const e = endOfDay(new Date(year, 5, 18));
+    return { s, e };
+  }  
+    
   function buildCampaignTop(year: number, win: {s: Date; e: Date}) {
     const byCust: Record<string,{ orders:number; rev:number; ordersIn:number; revIn:number; last:Date }> = {};
     rows.forEach(r=>{
@@ -524,11 +558,11 @@ export default function Home() {
     return list;
   }
   const campaignLists = useMemo(()=>{
-    if (!rows.length) return { d11: [], bf: [] as {customer_email:string; amount:number; avgOrder:number; last:Date}[] };
+    if (!rows.length) return { d11: [], six18: [] as {customer_email:string; amount:number; avgOrder:number; last:Date}[] };
     const y = getLastYearKeyDate();
     const d11 = buildCampaignTop(y, double11Window(y));
-    const bf  = buildCampaignTop(y, blackFridayWindow(y));
-    return { d11, bf };
+    const six18  = buildCampaignTop(y, six18Window(y));
+    return { d11, six18 };
   }, [rows]);
 
   const API_BASE =
@@ -554,6 +588,33 @@ export default function Home() {
     }
     throw new Error('backend unavailable');
   }
+
+  async function fetchAssocForWindow(rowsInput: Row[], win: { s: Date; e: Date }) {
+    const payload = {
+      rows: rowsInput.map(r => ({
+        date: r.date,
+        product_name: r.product_name,
+        revenue: r.revenue,
+        quantity: r.quantity,
+        product_category: r.product_category ?? undefined,
+        customer_name: r.customer_name ?? undefined,
+        customer_email: r.customer_email ?? undefined,
+        order_id: r.order_id ?? undefined,
+      })),
+      date_from: format(win.s, 'yyyy-MM-dd'),
+      date_to: format(win.e, 'yyyy-MM-dd'),
+    };
+
+    const res = await fetchWithRetry(`${API_BASE}/assoc_window`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    return (data?.assoc_rules ?? []) as AssocRule[];
+  }
+
 
   // ✅ 修正：送正確欄位給後端（包含 revenue，不再使用 amount）
   async function analyzeOnServer(input?: Row[]) {
@@ -921,7 +982,7 @@ export default function Home() {
                 </ResponsiveContainer>
               </div>
 
-              {/* 去年雙11 / 黑五名單 */}
+              {/* 去年雙11 / 618名單 */}
               <div className="grid md:grid-cols-2 gap-6">
                 <CampaignCard
                   title="去年雙11消費高於個人平均的客戶（Top10）"
@@ -929,9 +990,9 @@ export default function Home() {
                   downloadName="double11_high.csv"
                 />
                 <CampaignCard
-                  title="去年黑五消費高於個人平均的客戶（Top10）"
-                  rows={campaignLists.bf}
-                  downloadName="blackfriday_high.csv"
+                  title="去年618年中慶消費高於個人平均的客戶（Top10）"
+                  rows={campaignLists.six18}
+                  downloadName="618_high.csv"
                 />
               </div>
             </section>
@@ -987,20 +1048,20 @@ export default function Home() {
                 )}
               </div>
 
-              {/* 建議：雙11 / 黑五（束合 + 檔期日） */}
+              {/* 建議：雙11 / 618（束合 + 檔期日） */}
               <div className="grid md:grid-cols-2 gap-6">
                 <SuggestionCard
                   title="雙11檔期建議（Bundle & 檔期）"
-                  rules={server?.assoc_rules || []}
+                  rules={assocD11 || []}
                   y={getLastYearKeyDate()}
                   winBuilder={double11Window}
                   monthlyAll={monthlyAll}
                 />
                 <SuggestionCard
-                  title="黑五檔期建議（Bundle & 檔期）"
-                  rules={server?.assoc_rules || []}
+                  title="618檔期建議（Bundle & 檔期）"
+                  rules={assoc618 || []}
                   y={getLastYearKeyDate()}
-                  winBuilder={blackFridayWindow}
+                  winBuilder={six18Window}
                   monthlyAll={monthlyAll}
                 />
               </div>
@@ -1215,7 +1276,7 @@ function SegmentCard({
   );
 }
 
-/* == 檔期名單卡片（雙11/黑五）== */
+/* == 檔期名單卡片（雙11/618）== */
 function CampaignCard({
   title,
   rows,
@@ -1259,7 +1320,7 @@ function CampaignCard({
               <th className="py-2">Email/ID</th>
               <th className="py-2 text-right">檔期間金額</th>
               <th className="py-2 text-right">個人平均</th>
-              <th className="py-2 text-right">最後消費</th>
+              <th className="py-2 text-right">最後消費(至今)</th>
             </tr>
           </thead>
           <tbody>

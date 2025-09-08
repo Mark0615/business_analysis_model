@@ -138,7 +138,13 @@ class Row(BaseModel):
     order_id: Optional[str] = None
 
 class AnalyzeIn(BaseModel):
+    rows: List[Row]  # 👈 只要 rows，別放 date_from/date_to
+
+class AnalyzeAssocIn(BaseModel):
     rows: List[Row]
+    date_from: str   # 'YYYY-MM-DD'
+    date_to: str     # 'YYYY-MM-DD'
+
 
 # ======================== Health ===============================
 @app.get("/ping")
@@ -209,13 +215,13 @@ def _assoc_rules(df: pd.DataFrame) -> Tuple[list, Dict[str, Any]]:
     return assoc_rules_out, diag
 
 def _rfm(df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, int], Dict[str, float], Dict[str, list], Dict[str, Any]]:
-    """RFM 分群（KMeans 失敗時退回分位數），並輸出加溫名單。"""
+    """RFM 分群（優先 KMeans；fallback 改用 R/F/M 加權分數 + 25/75 分位），並輸出加溫名單。"""
     try:
         KMeans, *_ = _lazy_import_ml()
     except Exception:
-        # 沒有 sklearn 時退回分位分群
         KMeans = None
 
+    # ====== 建客戶鍵 / 訂單鍵 ======
     cust_key = df.get("customer_email", pd.Series([""] * len(df))).fillna("").str.strip()
     if not (cust_key.str.len() > 0).any():
         cust_key = df.get("customer_name", pd.Series([""] * len(df))).fillna("").str.strip()
@@ -227,6 +233,7 @@ def _rfm(df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, int], Dict[str, 
         df["basket_id"] = df["customer_id"].fillna("") + "_" + df["date"].dt.strftime("%Y-%m-%d")
     df["order_key"] = df["basket_id"]
 
+    # ====== 客戶彙總 ======
     cust = (df.groupby("customer_id")
               .agg(last_date=("date", "max"),
                    orders=("order_key", pd.Series.nunique),
@@ -234,7 +241,7 @@ def _rfm(df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, int], Dict[str, 
               .reset_index())
     cust = cust[cust["customer_id"].fillna("").str.len() > 0]
 
-    customers_total = int(df["customer_id"].fillna("").str.len().gt(0).sum())
+    customers_total = int(cust["customer_id"].nunique())
     customers_used = int(len(cust))
 
     rfm_share = {"low": 0.0, "mid": 0.0, "high": 0.0}
@@ -242,17 +249,20 @@ def _rfm(df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, int], Dict[str, 
     rfm_avg_monetary = {"low": 0.0, "mid": 0.0, "high": 0.0}
     nurture: Dict[str, list] = {"mid": [], "low": []}
     reason = None
+    method = None  # 新增：告知這次用 kmeans 或 quantile
 
     if len(cust) >= 3:
         max_date = df["date"].max()
-        cust["recency"] = (max_date - cust["last_date"]).dt.days
+        cust["recency"] = (max_date - cust["last_date"]).dt.days.astype(float).clip(lower=0)
 
-        # 先試 KMeans，失敗或群數不佳再退回分位數
+        # ====== 先試 KMeans ======
         use_quantile = False
         if KMeans is not None:
             try:
-                X = cust[["recency", "orders", "monetary"]]
+                # 特徵標準化
+                X = cust[["recency", "orders", "monetary"]].astype(float)
                 X = (X - X.mean()) / (X.std(ddof=0) + 1e-9)
+
                 km = KMeans(n_clusters=3, n_init=10, random_state=42)
                 cust["segment"] = km.fit_predict(X)
 
@@ -260,33 +270,59 @@ def _rfm(df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, int], Dict[str, 
                 if (len(counts) < 3) or (counts.min() <= 1):
                     use_quantile = True
                 else:
+                    # 依各群平均 monetary 排序 → 指派 low/mid/high
                     rank = (cust.groupby("segment")["monetary"]
                               .mean().sort_values().reset_index())
                     rank["level"] = ["low", "mid", "high"]
                     m = dict(zip(rank["segment"], rank["level"]))
                     cust["level"] = cust["segment"].map(m)
+                    method = "kmeans"
             except Exception:
                 use_quantile = True
         else:
             use_quantile = True
 
+        # ====== 退回：用 R/F/M 加權分數 + 25/75 分位（避免硬三等份，且考慮 R/F/M） ======
         if use_quantile:
-            q1, q2 = cust["monetary"].quantile([1/3, 2/3])
-            def lvl(v):
-                if v <= q1: return "low"
-                elif v <= q2: return "mid"
+            # rank 到 0~1：Recency 越小越好 → 用負號反向
+            def to_rank(series: pd.Series, reverse: bool = False) -> pd.Series:
+                s = series.astype(float)
+                if reverse: s = -s
+                order = s.rank(method="average", pct=True)  # 0~1
+                return order
+
+            r_rank = to_rank(cust["recency"], reverse=True)   # recency 越新越高分
+            f_rank = to_rank(cust["orders"],  reverse=False)
+            m_rank = to_rank(cust["monetary"], reverse=False)
+
+            score = 0.2 * r_rank + 0.3 * f_rank + 0.5 * m_rank
+            cust["rfm_score"] = score
+
+            t1 = score.quantile(0.25)  # 25%
+            t2 = score.quantile(0.75)  # 75%
+
+            def lvl_sc(s):
+                if s <= t1: return "low"
+                elif s <= t2: return "mid"
                 else: return "high"
-            cust["level"] = cust["monetary"].apply(lvl)
 
-        total_rev = float(cust["monetary"].sum())
-        for lv in ["low", "mid", "high"]:
-            rfm_counts[lv] = int((cust["level"] == lv).sum())
-            avg = float(cust.loc[cust["level"] == lv, "monetary"].mean() or 0.0)
-            rfm_avg_monetary[lv] = round(avg, 2)
-            part = float(cust.loc[cust["level"] == lv, "monetary"].sum())
-            rfm_share[lv] = round(part / total_rev, 4) if total_rev > 0 else 0.0
+            cust["level"] = cust["rfm_score"].apply(lvl_sc)
+            method = "quantile"
 
-        # 加溫名單（mid/low 各自條件）
+        # ====== 統計輸出 ======
+        levels = ["low", "mid", "high"]
+
+        cnt_map = cust["level"].value_counts().to_dict()
+        rfm_counts = {lv: int(cnt_map.get(lv, 0)) for lv in levels}
+
+        avg_map = {lv: float(cust.loc[cust["level"] == lv, "monetary"].mean() or 0.0) for lv in levels}
+        rfm_avg_monetary = {lv: round(avg_map.get(lv, 0.0), 2) for lv in levels}
+
+        total_rev = float(cust["monetary"].sum() or 0.0)
+        share_sum_map = {lv: float(cust.loc[cust["level"] == lv, "monetary"].sum()) for lv in levels}
+        rfm_share = {lv: (round(share_sum_map.get(lv, 0.0) / total_rev, 4) if total_rev > 0 else 0.0) for lv in levels}
+
+        # ====== 加溫名單（mid/low） ======
         r_th = 45
         m_th_mid = cust.loc[cust["level"] == "mid", "monetary"].median() if (cust["level"] == "mid").any() else 0.0
         m_th_low = cust.loc[cust["level"] == "low", "monetary"].median() if (cust["level"] == "low").any() else 0.0
@@ -309,14 +345,17 @@ def _rfm(df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, int], Dict[str, 
 
     else:
         reason = "no_customer_key_or_too_few"
+        method = "na"
 
     diag = {
         "ok": customers_used >= 3,
         "customers_total": customers_total,
         "customers_used": customers_used,
-        "reason": reason
+        "reason": reason,
+        "method": method,  # 新增：kmeans / quantile / na
     }
     return rfm_share, rfm_counts, rfm_avg_monetary, nurture, diag
+
 
 def _potential_products(df: pd.DataFrame,
                         top5_names: set,
@@ -346,6 +385,43 @@ def _potential_products(df: pd.DataFrame,
     return out
 
 # ========================= API ================================
+@app.post("/assoc_window")
+def assoc_window(payload: AnalyzeAssocIn, request: Request):
+    n = len(payload.rows or [])
+    if n == 0:
+        return {"error": "no_rows",
+                "diagnostics": {"assoc": {"ok": False, "reason": "empty_payload"}}}
+
+    df = pd.DataFrame([r.dict() for r in payload.rows])
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["product_name"] = df["product_name"].astype(str).str.strip()
+    df = df.dropna(subset=["date", "product_name"])
+
+    try:
+        s = pd.to_datetime(payload.date_from)
+        e = pd.to_datetime(payload.date_to)
+    except Exception:
+        raise HTTPException(status_code=422, detail={"error": "invalid_dates"})
+
+    win_df = df[(df["date"] >= s) & (df["date"] <= e)].copy()
+    if win_df.empty:
+        return {
+            "assoc_rules": [],
+            "diagnostics": {
+                "assoc": {"ok": False, "reason": "window_empty", "baskets_total": 0, "baskets_valid": 0},
+                "window": {"from": payload.date_from, "to": payload.date_to, "rows": 0}
+            }
+        }
+
+    assoc_rules, assoc_diag = _assoc_rules(win_df)
+    return {
+        "assoc_rules": assoc_rules,
+        "diagnostics": {
+            "assoc": assoc_diag,
+            "window": {"from": payload.date_from, "to": payload.date_to, "rows": int(len(win_df))}
+        }
+    }
+
 @app.post("/analyze")
 async def analyze(payload: AnalyzeIn, request: Request):
     rid = getattr(request.state, "rid", "-")
