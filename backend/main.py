@@ -441,6 +441,7 @@ async def analyze(payload: AnalyzeIn, request: Request):
         "diagnostics": {"assoc": assoc_diag, "rfm": rfm_diag, "required": {"ok": True}},
     }
 
+
 # 可本機測試時啟動（Render/Cloud Run 不需要）
 # if __name__ == "__main__":
 #     import uvicorn

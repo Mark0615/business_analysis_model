@@ -202,18 +202,6 @@ function normalizeRow(r: RawRow): Row | null {
 /* ==================== 主頁 ==================== */
 type Tab = 'summary' | 'customers' | 'products';
 
-<AiPptButton
-  payload={{
-    kpi,
-    monthly: monthly12,
-    top5_products: top5,
-    top_categories: topCats,
-    assoc_rules: server?.assoc_rules || [],
-    notes: serverNote || '',
-  }}
-/>
-
-
 export default function Home() {
   useEffect(() => {
     document.documentElement.classList.remove('dark');
@@ -1347,63 +1335,3 @@ function SuggestionCard({
     </div>
   );
 }
-
-function AiPptButton({ payload }: { payload: any }) {
-  const [busy, setBusy] = useState(false);
-
-  async function click() {
-    setBusy(true);
-    try {
-      const res = await fetch(`${API_BASE}/ppt/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = 'report.pptx'; a.click();
-      URL.revokeObjectURL(url);
-    } catch (e:any) {
-      alert('下載失敗：' + (e?.message || 'unknown'));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-function AiPptButton({ payload }: { payload: any }) {
-  const [busy, setBusy] = useState(false);
-
-  async function click() {
-    setBusy(true);
-    try {
-      const res = await fetch(`${API_BASE}/ppt/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = 'report.pptx'; a.click();
-      URL.revokeObjectURL(url);
-    } catch (e:any) {
-      alert('下載失敗：' + (e?.message || 'unknown'));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <button
-      onClick={click}
-      disabled={busy}
-      className="px-3 py-2 rounded-md border border-slate-300 text-slate-700 hover:bg-slate-50 shadow-sm"
-    >
-      {busy ? '生成中…' : '下載 AI 簡報（PPT）'}
-    </button>
-  );
-}
-
