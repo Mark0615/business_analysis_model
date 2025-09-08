@@ -1018,6 +1018,58 @@ export default function Home() {
     </>
   );
 }
+// ===== Currency & small utils (SSR-safe) =====
+const LOCALE = process.env.NEXT_PUBLIC_LOCALE || 'zh-TW';
+const CURRENCY = process.env.NEXT_PUBLIC_CURRENCY || 'TWD';
+
+export function formatCurrency(
+  v: number | null | undefined,
+  options: Intl.NumberFormatOptions = {}
+): string {
+  const n = Number(v ?? 0);
+  try {
+    return new Intl.NumberFormat(LOCALE, {
+      style: 'currency',
+      currency: CURRENCY,
+      maximumFractionDigits: 0,
+      ...options,
+    }).format(n);
+  } catch {
+    // 極端情況（Intl 不可用）退回純字串
+    return `${n.toLocaleString()} ${CURRENCY}`;
+  }
+}
+
+function labelOf(k: 'high' | 'mid' | 'low') {
+  return k === 'high' ? '高價值' : k === 'mid' ? '中價值' : '低價值';
+}
+
+function downloadCsv(fileName: string, rows: any[]) {
+  if (!rows || rows.length === 0) return;
+  const header = Object.keys(rows[0]);
+  const lines = [
+    header.join(','),
+    ...rows.map((r) =>
+      header
+        .map((h) => {
+          const raw = r[h] ?? '';
+          const s = String(raw).replace(/"/g, '""');
+          return /[",\n]/.test(s) ? `"${s}"` : s;
+        })
+        .join(',')
+    ),
+  ];
+  const blob = new Blob([lines.join('\n')], {
+    type: 'text/csv;charset=utf-8;',
+  });
+  if (typeof window === 'undefined') return; // 避免 SSR 觸發
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 /* ==================== 小元件 ==================== */
 function TabBtn({ active, onClick, children }:{active:boolean; onClick:()=>void; children:any}) {
@@ -1068,6 +1120,218 @@ function KpiCardWithSpark({
           </AreaChart>
         </ResponsiveContainer>
       </div>
+    </div>
+  );
+}
+/* == 小徽章 == */
+function Badge({ label, value }: { label: string; value: string }) {
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full border border-slate-300 px-2 py-0.5 text-xs text-slate-600">
+      <span className="opacity-70">{label}:</span>
+      <span className="font-medium">{value}</span>
+    </span>
+  );
+}
+
+/* == MoM / WoW 卡片 == */
+type DeltaDetail = {
+  pct: number | null;
+  diff: number;
+  prev: number;
+  curr: number;
+  labels: { prev: string; curr: string };
+} | null;
+
+function DeltaCard({ label, detail }: { label: string; detail: DeltaDetail }) {
+  const has = !!detail && detail.pct !== null;
+  const pct = has ? (detail!.pct! * 100) : null;
+  const up = (pct ?? 0) >= 0;
+
+  return (
+    <div className="rounded-2xl border border-slate-200 p-4 shadow-sm">
+      <div className="text-sm font-semibold text-slate-700 mb-2">{label}</div>
+      {has ? (
+        <div>
+          <div className={`text-2xl font-bold ${up ? 'text-emerald-600' : 'text-rose-600'}`}>
+            {up ? '▲' : '▼'} {Math.abs(pct!).toFixed(1)}%
+          </div>
+          <div className="mt-1 text-xs text-slate-500">
+            {detail!.labels.prev}: {formatCurrency(detail!.prev)} → {detail!.labels.curr}: {formatCurrency(detail!.curr)}
+          </div>
+          <div className="mt-1 text-xs text-slate-500">
+            差額：{formatCurrency(detail!.diff)}
+          </div>
+        </div>
+      ) : (
+        <div className="text-slate-400 text-sm">資料不足</div>
+      )}
+    </div>
+  );
+}
+
+/* == RFM 區塊卡片 == */
+function SegmentCard({
+  title,
+  share,
+  count,
+  avg,
+  gradientFrom,
+  gradientTo,
+}: {
+  title: string;
+  share: number;
+  count?: number;
+  avg?: number;
+  gradientFrom: string;
+  gradientTo: string;
+}) {
+  const pct = Math.max(0, Math.min(1, Number(share || 0)));
+  return (
+    <div className="rounded-2xl border border-slate-200 p-4 shadow-sm">
+      <div className="flex items-center justify-between">
+        <div className="text-sm font-semibold text-slate-700">{title}</div>
+        <div className="text-slate-500 text-xs">{(pct * 100).toFixed(1)}%</div>
+      </div>
+      <div className="mt-2 h-2 w-full rounded-full bg-slate-100 overflow-hidden">
+        <div
+          className="h-full"
+          style={{
+            width: `${pct * 100}%`,
+            background: `linear-gradient(90deg, ${gradientFrom}, ${gradientTo})`,
+          }}
+        />
+      </div>
+      <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-600">
+        <div className="flex justify-between">
+          <span>人數</span>
+          <span className="font-medium">{(count ?? 0).toLocaleString()}</span>
+        </div>
+        <div className="flex justify-between">
+          <span>平均金額</span>
+          <span className="font-medium">{formatCurrency(avg ?? 0)}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* == 檔期名單卡片（雙11/黑五）== */
+function CampaignCard({
+  title,
+  rows,
+  downloadName,
+}: {
+  title: string;
+  rows: { customer_email: string; amount: number; avgOrder: number; last: Date | string }[];
+  downloadName: string;
+}) {
+  const handleDownload = () => {
+    const out = rows.map(r => ({
+      customer_email: r.customer_email,
+      amount: Math.round(r.amount),
+      avg_order: Math.round(r.avgOrder),
+      last_order_date: typeof r.last === 'string'
+        ? r.last
+        : new Date(r.last).toISOString().slice(0, 10),
+    }));
+    downloadCsv(downloadName, out);
+  };
+
+  return (
+    <div className="rounded-2xl border border-slate-200 p-4 shadow-sm">
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-sm font-semibold text-slate-700">{title}</h3>
+        {rows.length > 0 && (
+          <button
+            onClick={handleDownload}
+            className="px-3 py-1.5 rounded-md border border-slate-300 text-slate-700 hover:bg-slate-50 text-xs"
+          >
+            下載 CSV
+          </button>
+        )}
+      </div>
+      {rows.length === 0 ? (
+        <div className="text-slate-400 text-sm text-center py-6">暫無名單</div>
+      ) : (
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left border-b border-slate-200 text-slate-500">
+              <th className="py-2">Email/ID</th>
+              <th className="py-2 text-right">檔期間金額</th>
+              <th className="py-2 text-right">個人平均</th>
+              <th className="py-2 text-right">最後消費</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.customer_email} className="border-b border-slate-100 last:border-none">
+                <td className="py-2">{r.customer_email}</td>
+                <td className="py-2 text-right">{formatCurrency(r.amount)}</td>
+                <td className="py-2 text-right">{formatCurrency(r.avgOrder)}</td>
+                <td className="py-2 text-right">
+                  {typeof r.last === 'string'
+                    ? r.last
+                    : new Date(r.last).toISOString().slice(0, 10)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+/* == 檔期建議（依關聯規則）== */
+function SuggestionCard({
+  title,
+  rules,
+  y,
+  winBuilder,
+  monthlyAll,
+}: {
+  title: string;
+  rules: { antecedents: string[]; consequents: string[]; support: number; confidence: number; lift: number }[];
+  y: number;
+  winBuilder: (y: number) => { s: Date; e: Date };
+  monthlyAll: { yyyymm: string; revenue: number; orders: number }[];
+}) {
+  const win = winBuilder(y);
+  const s = `${win.s.getFullYear()}-${String(win.s.getMonth() + 1).padStart(2, '0')}-${String(win.s.getDate()).padStart(2, '0')}`;
+  const e = `${win.e.getFullYear()}-${String(win.e.getMonth() + 1).padStart(2, '0')}-${String(win.e.getDate()).padStart(2, '0')}`;
+
+  const top = (rules || []).slice(0, 3);
+
+  return (
+    <div className="rounded-2xl border border-slate-200 p-4 shadow-sm">
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-sm font-semibold text-slate-700">{title}</h3>
+        <span className="text-xs text-slate-500">檔期：{s} ~ {e}</span>
+      </div>
+
+      {top.length === 0 ? (
+        <div className="text-slate-400 text-sm text-center py-6">尚無顯著規則</div>
+      ) : (
+        <ol className="list-decimal pl-5 space-y-2 text-sm text-slate-700">
+          {top.map((r, i) => (
+            <li key={i}>
+              <span className="font-medium">{r.antecedents.join(' + ')}</span>
+              <span className="mx-1 text-slate-400">→</span>
+              <span className="font-medium">{r.consequents.join(' + ')}</span>
+              <div className="mt-1 flex gap-2 text-xs text-slate-600">
+                <Badge label="Lift" value={r.lift.toFixed(2)} />
+                <Badge label="Conf." value={(r.confidence * 100).toFixed(1) + '%'} />
+                <Badge label="Supp." value={(r.support * 100).toFixed(1) + '%'} />
+              </div>
+            </li>
+          ))}
+        </ol>
+      )}
+
+      {/* 小提示 */}
+      <p className="mt-3 text-xs text-slate-500">
+        建議將以上組合做成套組或加價購，並在檔期前 7~10 天暖身，檔期當週加強再行銷。
+      </p>
     </div>
   );
 }
