@@ -54,29 +54,46 @@ type ServerInsights = {
 
 /* ==================== 欄位別名 & 日期/數值處理 ==================== */
 export const REQUIRED = ['date','product_name','revenue'] as const;
+
+// 英/中常見別名
 export const ALIASES: Record<string, string[]> = {
   /* 必填 */
-  date: ['date','order date','invoice date','dt','order_date','invoice_date'],
-  product_name: ['product_name','product name','product','item','product line','sku name','sku','item name','lineitem name'],
-  revenue: ['revenue','sales','total','amount','sales amount','total price','gross sales','gross income','line total','extended price','subtotal'],
+  date: [
+    'date','order date','invoice date','dt','order_date','invoice_date',
+    '日期','訂單日期','交易日期','銷售日期'
+  ],
+  product_name: [
+    'product_name','product name','product','item','product line','sku name','sku','item name','lineitem name',
+    '商品名稱','產品名稱','品名','商品','項目','品項'
+  ],
+  revenue: [
+    'revenue','sales','total','amount','sales amount','total price','gross sales','gross income','line total','extended price','subtotal',
+    '營收','金額','成交金額','銷售金額','實收','應收','訂單金額','總額','付款金額'
+  ],
 
   /* 選填 */
-  product_category: ['product_category','category','product line','lineitem_category','cat','dept','department'],
-  quantity: ['quantity','qty','units','count','quantity ordered','order qty','order quantity','lineitem quantity'],
+  product_category: [
+    'product_category','category','product line','lineitem_category','cat','dept','department',
+    '商品類別','類別','分類','部門'
+  ],
+  quantity: [
+    'quantity','qty','units','count','quantity ordered','order qty','order quantity','lineitem quantity',
+    '數量','件數','購買數','購買數量'
+  ],
 
-  // 單價/原價/折扣（盡量涵蓋常見欄位）
-  unit_price: ['lineitem price','line item price','unit price','price','sale price'],
-  list_price: ['compare at price','list price','original price','msrp'],
-  discount_amount: ['discount','discount amount','lineitem discount','promotion discount','promo discount'],
-  coupon_code: ['coupon','coupon code','promo code','promotion code'],
+  // 單價/原價/折扣
+  unit_price: ['lineitem price','line item price','unit price','price','sale price','單價','成交單價'],
+  list_price: ['compare at price','list price','original price','msrp','原價','標價'],
+  discount_amount: ['discount','discount amount','lineitem discount','promotion discount','promo discount','折扣','折扣金額'],
+  coupon_code: ['coupon','coupon code','promo code','promotion code','優惠碼','折扣碼'],
 
   // 客戶 & 訂單鍵
-  customer_name: ['customer_name','name','customer','customer name','buyer','client name'],
-  customer_email: ['customer_email','email','e-mail','customer email','buyer email'],
-  order_id: ['order_id','order number','invoice id','order id','invoice','order_no','order-no'],
+  customer_name: ['customer_name','name','customer','customer name','buyer','client name','客戶姓名','顧客姓名','買家'],
+  customer_email: ['customer_email','email','e-mail','customer email','buyer email','電子郵件','email信箱','信箱'],
+  order_id: ['order_id','order number','invoice id','order id','invoice','order_no','order-no','訂單編號','訂單號'],
 
-  // 城市 / 配送城市
-  shipping_city: ['shipping city','ship city','city','shipping address city','recipient city'],
+  // 城市
+  shipping_city: ['shipping city','ship city','city','shipping address city','recipient city','配送城市','收件城市','城市']
 };
 
 function pick(row: Record<string, string>, canonical: keyof typeof ALIASES) {
@@ -130,7 +147,7 @@ function normalizeRow(r: RawRow): Row | null {
   const quantity = (() => {
     const q = toNumber(pick(r, 'quantity'));
     if (Number.isFinite(q) && q > 0) return q;
-    return 1; // 沒有數量就當作 1 筆
+    return 1;
   })();
 
   let revenue = toNumber(pick(r, 'revenue'));
@@ -139,7 +156,6 @@ function normalizeRow(r: RawRow): Row | null {
   const discount_amount = toNumber(pick(r, 'discount_amount'));
   const coupon_code = (pick(r, 'coupon_code') || '').trim() || null;
 
-  // 若有單價則以「單價 × 數量」為列營收（避免用訂單 Total 造成重複）
   if ((revenue === 0 || !Number.isFinite(revenue)) && Number.isFinite(unit_price_from_alias)) {
     revenue = unit_price_from_alias * (quantity || 1);
   }
@@ -152,7 +168,6 @@ function normalizeRow(r: RawRow): Row | null {
     ? list_price_from_alias
     : undefined;
 
-  // 折扣判定：有折扣金額>0、或原價>成交單價（>1%）
   const was_discounted =
     (!!discount_amount && discount_amount > 0) ||
     (!!list_price && !!unit_price && list_price > unit_price * 1.01) ||
@@ -188,7 +203,6 @@ function normalizeRow(r: RawRow): Row | null {
 type Tab = 'summary' | 'customers' | 'products';
 
 export default function Home() {
-  // 強制白底 + 避免水平捲軸
   useEffect(() => {
     document.documentElement.classList.remove('dark');
     document.body.classList.add('bg-white', 'overflow-x-hidden');
@@ -201,10 +215,25 @@ export default function Home() {
   const [serverNote, setServerNote] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('summary');
 
-  // 讀 CSV + 自動呼叫後端
-  const onFile = (f: File) => {
+  // === 讀 CSV（UTF-8 → BIG5 fallback）+ 自動呼叫後端 ===
+  const onFile = async (f: File) => {
     setFileName(f.name); setServer(null); setServerNote(null); setNotice(null);
-    Papa.parse<RawRow>(f, {
+
+    // 1) 讀進 ArrayBuffer
+    const buf = await f.arrayBuffer();
+
+    // 2) 嘗試 UTF-8，若 � 太多就以 BIG5 重新解碼
+    let text = new TextDecoder('utf-8', { fatal: false }).decode(buf);
+    const bad = (text.match(/\uFFFD/g) || []).length;
+    if (bad > text.length * 0.01) {
+      try {
+        text = new TextDecoder('big5').decode(buf);
+      } catch {
+        // 若瀏覽器不支援 big5，就保留原文本
+      }
+    }
+
+    Papa.parse<RawRow>(text, {
       header: true,
       skipEmptyLines: true,
       transformHeader: (h: string) => (h ?? '').toString().replace(/^\uFEFF/, '').toLowerCase().trim(),
@@ -321,9 +350,7 @@ export default function Home() {
     if (!rows.length) return [];
     const m = new Map<string, { fullQty: number; discQty: number; total: number }>();
     for (const r of rows) {
-      // ✅ 只統計有金額的列，排除 Shipping 等金額為 0 的項
       if ((r.revenue ?? 0) <= 0) continue;
-
       const rec = m.get(r.product_name) || { fullQty: 0, discQty: 0, total: 0 };
       if (r.was_discounted) rec.discQty += r.quantity || 1;
       else rec.fullQty += r.quantity || 1;
@@ -336,12 +363,11 @@ export default function Home() {
       .slice(0, 5);
   }, [rows]);
 
-  // ✅ 以「折扣量」由大到小排序（不是折扣占比）
   const mustDiscountTop5 = useMemo(() => {
     const MIN_TOTAL = 5;
     const m = new Map<string, { fullQty: number; discQty: number; total: number }>();
     for (const r of rows) {
-      if ((r.revenue ?? 0) <= 0) continue; // 同樣只計入金額>0
+      if ((r.revenue ?? 0) <= 0) continue;
       const rec = m.get(r.product_name) || { fullQty: 0, discQty: 0, total: 0 };
       if (r.was_discounted) rec.discQty += r.quantity || 1;
       else rec.fullQty += r.quantity || 1;
@@ -355,10 +381,9 @@ export default function Home() {
         ratio: v.total>0 ? v.discQty/v.total : 0
       }))
       .filter(x => x.total >= MIN_TOTAL && x.discQty > 0)
-      .sort((a,b)=> b.discQty - a.discQty) // ⬅️ 改這裡：折扣量由大到小
+      .sort((a,b)=> b.discQty - a.discQty)
       .slice(0, 5);
   }, [rows]);
-
 
   /* ========== 客戶聚合（for 下載高價值、頻次等） ========== */
   type CustAgg = { id: string; last: Date; orders: number; revenue: number };
@@ -368,7 +393,7 @@ export default function Home() {
     for (const r of rows) {
       const id = (r.customer_email && r.customer_email.trim()) || (r.customer_name && r.customer_name.trim()) || '';
       if (!id) continue;
-      const keyOrder = r.order_id ? r.order_id : `${id}_${r.date}`; // 跟後端邏輯接近
+      const keyOrder = r.order_id ? r.order_id : `${id}_${r.date}`;
       const rec = map.get(id) || { last: new Date(0), ordersSet: new Set<string>(), revenue: 0 };
       const d = parseISO(r.date);
       if (d > rec.last) rec.last = d;
@@ -379,22 +404,20 @@ export default function Home() {
     return [...map.entries()].map(([id, v]) => ({ id, last: v.last, orders: v.ordersSet.size, revenue: v.revenue }));
   }, [rows]);
 
-  // 前端近似 RFM 分數：score = 0.5*rank(M) + 0.3*rank(F) + 0.2*rank(-R)
+  // 前端近似 RFM 等級
   const localRfmLevels = useMemo(() => {
     if (!customersAgg.length) return new Map<string,'low'|'mid'|'high'>();
     const maxDate = rows.map(r=>parseISO(r.date)).sort((a,b)=>b.getTime()-a.getTime())[0] || new Date();
     const recDays = customersAgg.map(c => ({ id: c.id, r: Math.max(0, (maxDate.getTime() - c.last.getTime())/86400000), o: c.orders, m: c.revenue }));
-    // rank helper
     const rank = (arr: number[]) => {
       const sorted = [...arr].slice().sort((a,b)=>a-b);
       const pos = (v: number) => (sorted.findIndex(x=>x===v) + sorted.lastIndexOf(v)) / 2 + 1;
       return arr.map(v => pos(v)/sorted.length);
     };
-    const rRank = rank(recDays.map(x=>-x.r)); // -R（越近越高）
+    const rRank = rank(recDays.map(x=>-x.r));
     const fRank = rank(recDays.map(x=> x.o));
     const mRank = rank(recDays.map(x=> x.m));
     const score = recDays.map((x,i)=> ({ id: x.id, s: 0.2*rRank[i] + 0.3*fRank[i] + 0.5*mRank[i] }));
-    // 切分：三等分（近似；真正切法在後端 KMeans）
     const sArr = score.map(x=>x.s).sort((a,b)=>a-b);
     const t1 = sArr[Math.floor(sArr.length/3)] ?? 0.33;
     const t2 = sArr[Math.floor(sArr.length*2/3)] ?? 0.66;
@@ -407,7 +430,7 @@ export default function Home() {
     return lv;
   }, [customersAgg, rows]);
 
-  // 平均頻次（近似）：依 localRfmLevels 分群算 orders 平均
+  // 平均頻次（近似）
   const avgFreqByLevel = useMemo(() => {
     const out = { low: 0, mid: 0, high: 0 };
     const cnt = { low: 0, mid: 0, high: 0 };
@@ -423,7 +446,7 @@ export default function Home() {
     };
   }, [customersAgg, localRfmLevels]);
 
-  // 高價值名單（前端產 CSV）：取 local 'high'
+  // 高價值名單（前端近似）
   const highValueDownloadRows = useMemo(()=>{
     const arr = customersAgg
       .filter(c => (localRfmLevels.get(c.id) || 'mid') === 'high')
@@ -443,22 +466,21 @@ export default function Home() {
     const m = new Map<string, number>();
     for (const r of rows) {
       const city = (r.shipping_city || '').trim();
-      if (!city) continue;           // ✅ 忽略空值
+      if (!city) continue;
       m.set(city, (m.get(city)||0) + (r.revenue || 0));
     }
     return [...m.entries()]
       .map(([city, revenue])=>({ city, revenue }))
-      .sort((a,b)=> b.revenue - a.revenue) // ✅ 由大到小
+      .sort((a,b)=> b.revenue - a.revenue)
       .slice(0,10);
   }, [rows]);
 
   const cityAxisWidth = useMemo(() => {
-  const maxLen = cityTop10.reduce((m, x) => Math.max(m, (x.city || '').length), 0);
-  // 依最長城市名稱抓一個合適寬度：介於 110 ~ 240px
-  return Math.min(240, Math.max(110, Math.ceil(maxLen * 8.5)));
-}, [cityTop10]);
+    const maxLen = cityTop10.reduce((m, x) => Math.max(m, (x.city || '').length), 0);
+    return Math.min(240, Math.max(110, Math.ceil(maxLen * 8.5)));
+  }, [cityTop10]);
 
-  /* ========== 檔期名單：去年雙11 / 去年黑五（消費高於個人平均） ========== */
+  /* ========== 檔期名單：去年雙11 / 去年黑五 ========== */
   function getLastYearKeyDate() {
     if (!rows.length) return new Date();
     const last = rows.map(r=>parseISO(r.date)).sort((a,b)=>b.getTime()-a.getTime())[0];
@@ -466,25 +488,20 @@ export default function Home() {
     return y;
   }
   function double11Window(year: number) {
-    // 11/10~11/12（可依需要改）
     const s = startOfDay(new Date(year, 10, 10));
     const e = endOfDay(new Date(year, 10, 12));
     return { s, e };
-    // 也可改成 11/01~11/15：new Date(year,10,1)~new Date(year,10,15)
   }
   function blackFridayWindow(year: number) {
-    // 取 11 月的第 4 個星期五 ~ 下週一（含 Cyber Monday）
     const nov1 = new Date(year, 10, 1);
     const day = nov1.getDay();
-    const firstFri = 5 - day >= 0 ? 5 - day : 12 - day; // 到第一個週五
+    const firstFri = 5 - day >= 0 ? 5 - day : 12 - day;
     const friday4th = new Date(year, 10, 1 + firstFri + 7*3);
     const s = startOfDay(friday4th);
     const e = endOfDay(new Date(friday4th.getFullYear(), friday4th.getMonth(), friday4th.getDate()+3));
     return { s, e };
   }
-
   function buildCampaignTop(year: number, win: {s: Date; e: Date}) {
-    // 個人平均：用全年平均每筆訂單金額（可改更精細）
     const byCust: Record<string,{ orders:number; rev:number; ordersIn:number; revIn:number; last:Date }> = {};
     rows.forEach(r=>{
       const id = (r.customer_email && r.customer_email.trim()) || (r.customer_name && r.customer_name.trim()) || '';
@@ -492,8 +509,7 @@ export default function Home() {
       const d = parseISO(r.date);
       const inWin = d >= win.s && d <= win.e;
       const rec = byCust[id] || { orders:0, rev:0, ordersIn:0, revIn:0, last: new Date(0) };
-      rec.orders += 1;
-      rec.rev += r.revenue;
+      rec.orders += 1; rec.rev += r.revenue;
       if (inWin) { rec.ordersIn += 1; rec.revIn += r.revenue; }
       if (d > rec.last) rec.last = d;
       byCust[id] = rec;
@@ -502,12 +518,11 @@ export default function Home() {
       const avgOrder = v.orders ? v.rev / v.orders : 0;
       return { customer_email: id, amount: Math.round(v.revIn), avgOrder, last: v.last };
     })
-    .filter(x => x.amount > x.avgOrder) // 檔期消費高於個人平均
+    .filter(x => x.amount > x.avgOrder)
     .sort((a,b)=> b.amount - a.amount)
     .slice(0, 10);
     return list;
   }
-
   const campaignLists = useMemo(()=>{
     if (!rows.length) return { d11: [], bf: [] as {customer_email:string; amount:number; avgOrder:number; last:Date}[] };
     const y = getLastYearKeyDate();
@@ -525,19 +540,13 @@ export default function Home() {
   async function fetchWithRetry(url: string, opts: RequestInit = {}, tries = 4) {
     for (let i = 0; i < tries; i++) {
       const ctrl = new AbortController();
-      const timeout = setTimeout(() => ctrl.abort(), 45_000); // 45s：給冷啟的時間
-
+      const timeout = setTimeout(() => ctrl.abort(), 45_000);
       try {
         const res = await fetch(url, { ...opts, signal: ctrl.signal });
         if (res.ok) return res;
-
-        // 暫時性錯誤：重試；其他直接回傳（讓上層看到實際錯誤）
-        if ([429, 500, 502, 503, 504, 522, 524].includes(res.status)) {
-          throw new Error('temporary');
-        }
+        if ([429, 500, 502, 503, 504, 522, 524].includes(res.status)) throw new Error('temporary');
         return res;
       } catch {
-        // 指數退避：1s → 2s → 4s → 最多 16s
         await new Promise(r => setTimeout(r, Math.min(16_000, 2 ** i * 1000)));
       } finally {
         clearTimeout(timeout);
@@ -546,13 +555,17 @@ export default function Home() {
     throw new Error('backend unavailable');
   }
 
+  // ✅ 修正：送正確欄位給後端（包含 revenue，不再使用 amount）
   async function analyzeOnServer(input?: Row[]) {
-    // 可選：把要傳給後端的欄位縮到最小，減少 payload/序列化負擔
     const slimRows = (input ?? rows).map(r => ({
       date: r.date,
-      customer_email: (r as any).customer_email ?? (r as any).customer_name,
       product_name: r.product_name,
-      amount: r.amount,
+      revenue: r.revenue,
+      quantity: r.quantity,
+      product_category: r.product_category ?? undefined,
+      customer_name: r.customer_name ?? undefined,
+      customer_email: r.customer_email ?? undefined,
+      order_id: r.order_id ?? undefined,
     }));
 
     const payload = { rows: slimRows };
@@ -563,11 +576,10 @@ export default function Home() {
     try {
       const res = await fetchWithRetry(`${API_BASE}/analyze`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
         body: JSON.stringify(payload),
       });
 
-      // 若不是 2xx，丟出錯誤讓 catch 接住
       if (!res.ok) {
         const text = await res.text().catch(() => '');
         throw new Error(`HTTP ${res.status} ${text || res.statusText}`);
@@ -576,7 +588,6 @@ export default function Home() {
       const data: ServerInsights = await res.json();
       setServer(data);
 
-      // ====== 你的診斷訊息邏輯：原封保留 ======
       const msgs: string[] = [];
       if (data.diagnostics?.assoc && !data.diagnostics.assoc.ok) {
         const d = data.diagnostics.assoc;
@@ -595,7 +606,6 @@ export default function Home() {
       setServerNote('呼叫後端失敗：' + (e?.message || 'unknown'));
     }
   }
-
 
   /* ==================== UI ==================== */
   return (
@@ -809,7 +819,6 @@ export default function Home() {
                         下載中價值客戶名單
                       </button>
                     )}
-                    {/* 將「低價值」改為下載「高價值」名單（前端近似） */}
                     {highValueDownloadRows.length>0 && (
                       <button
                         onClick={()=>downloadCsv('high_value.csv', highValueDownloadRows)}
@@ -875,7 +884,7 @@ export default function Home() {
                 <h3 className="text-sm font-semibold text-slate-700 mb-2">消費最高城市 Top10（依營收）</h3>
                 <ResponsiveContainer
                   width="100%"
-                  height={Math.max(280, cityTop10.length * 44)} // 每列留 44px，列多就自動增高
+                  height={Math.max(280, cityTop10.length * 44)}
                 >
                   <BarChart
                     data={cityTop10}
@@ -888,7 +897,7 @@ export default function Home() {
                       type="category"
                       dataKey="city"
                       width={cityAxisWidth}
-                      interval={0}              // ✅ 每一列都顯示
+                      interval={0}
                       tick={{ fontSize: 12, fill: '#475569' }}
                       tickLine={false}
                       axisLine={false}
@@ -1036,180 +1045,4 @@ function KpiCardWithSpark({ title, value, data }:{ title:string; value:string; d
             <defs>
               <linearGradient id="sparkGrad" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stopColor="#60a5fa" stopOpacity={0.5} />
-                <stop offset="100%" stopColor="#60a5fa" stopOpacity={0.05} />
-              </linearGradient>
-            </defs>
-            <Area type="monotone" dataKey="y" stroke="#60a5fa" strokeWidth={2} fill="url(#sparkGrad)" />
-          </AreaChart>
-        </ResponsiveContainer>
-      </div>
-    </div>
-  );
-}
-
-function DeltaCard({
-  label, detail
-}:{ label:'MoM'|'WoW';
-   detail: {pct:number|null; diff:number; prev:number; curr:number; labels?:{prev:string; curr:string}} | null }) {
-  const ok = detail && detail.pct !== null;
-  const pct = ok ? ((detail!.pct as number)*100).toFixed(1)+'%' : '—';
-  const diff = ok ? formatCurrency(detail!.diff) : '—';
-  const trend = ok && (detail!.pct as number) >= 0 ? '▲' : ok ? '▼' : '';
-  return (
-    <div className="rounded-2xl border border-slate-200 p-4 bg-gradient-to-b from-white to-slate-50 flex flex-col justify-center shadow-sm">
-      <div className="text-xs text-slate-500 mb-1">{label}</div>
-      <div className="text-2xl font-semibold text-slate-800">{pct} <span className="text-slate-400 text-base">{trend}</span></div>
-      <div className="text-xs text-slate-500 mt-1">差異：{diff}</div>
-      {detail?.labels && (
-        <div className="text-xs text-slate-500 mt-1">
-          <span className="inline-block mr-2">本期：{detail.labels.curr}</span>
-          <span>對比：{detail.labels.prev}</span>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function SegmentCard({ title, share, count, gradientFrom, gradientTo }:{
-  title:string; share:number; count?:number;
-  gradientFrom:string; gradientTo:string;
-}) {
-  const pct = (share*100).toFixed(1)+'%';
-  return (
-    <div className="rounded-2xl border border-slate-200 p-4 shadow-sm">
-      <div className="flex items-center justify-between mb-2">
-        <div className="text-sm font-medium text-slate-700">{title}</div>
-        <div className="text-sm text-slate-500">{count!=null ? `人數 ${count}` : '人數 —'}</div>
-      </div>
-      <div className="h-3 w-full rounded-full bg-slate-100 overflow-hidden">
-        <div
-          className="h-full rounded-full"
-          style={{
-            width: `${Math.max(0, Math.min(100, share*100))}%`,
-            background: `linear-gradient(90deg, ${gradientFrom}, ${gradientTo})`
-          }}
-        />
-      </div>
-      <div className="flex items-center justify-between mt-2 text-sm">
-        <div className="text-slate-800 font-semibold">{pct}</div>
-        {/* 移除平均銷售文字 */}
-      </div>
-    </div>
-  );
-}
-
-
-function Badge({ label, value, tip }:{label:string; value:string; tip?:string}) {
-  return (
-    <span title={tip} className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full
-                                 bg-slate-100 text-slate-700 border border-slate-200">
-      <span className="font-semibold">{label}</span><span>{value}</span>
-    </span>
-  );
-}
-
-function CampaignCard({
-  title, rows, downloadName
-}:{ title:string; rows:{customer_email:string; amount:number; avgOrder:number; last:Date}[]; downloadName:string }) {
-  return (
-    <div className="rounded-2xl border border-slate-200 p-4 shadow-sm">
-      <div className="flex items-center justify-between mb-2">
-        <h3 className="text-sm font-semibold text-slate-700">{title}</h3>
-        {rows.length>0 && (
-          <button
-            onClick={()=>downloadCsv(downloadName, rows.map(r=>({
-              customer_email:r.customer_email,
-              amount:r.amount,
-              avg_order: Math.round(r.avgOrder),
-              last_order_date: format(r.last,'yyyy-MM-dd')
-            })))}
-            className="px-3 py-2 rounded-md border border-slate-300 text-slate-700 hover:bg-slate-50 shadow-sm">
-            下載名單
-          </button>
-        )}
-      </div>
-      <table className="w-full text-sm">
-        <thead>
-          <tr className="text-left border-b border-slate-200 text-slate-500">
-            <th className="py-2">Email / 客戶鍵</th>
-            <th className="py-2 text-right">檔期金額</th>
-            <th className="py-2 text-right">個人平均單筆</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r)=>(
-            <tr key={r.customer_email} className="border-b border-slate-100 last:border-none">
-              <td className="py-2">{r.customer_email}</td>
-              <td className="py-2 text-right">{formatCurrency(r.amount)}</td>
-              <td className="py-2 text-right">{formatCurrency(r.avgOrder)}</td>
-            </tr>
-          ))}
-          {rows.length===0 && <tr><td colSpan={3} className="py-6 text-center text-slate-400">暫無資料</td></tr>}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function SuggestionCard({
-  title, rules, y, winBuilder, monthlyAll
-}:{
-  title:string;
-  rules: AssocRule[];
-  y: number;
-  winBuilder: (y:number)=>{s:Date; e:Date};
-  monthlyAll: Monthly[];
-}) {
-  // 簡單的 bundle：取 lift 前 3 名的 antecedents+consequents
-  const bundles = rules
-    .slice(0)
-    .sort((a,b)=> b.lift - a.lift)
-    .slice(0,3)
-    .map((r)=> `${r.antecedents.join(' + ')} → ${r.consequents.join(' + ')}`);
-
-  // 建議檔期：看去年該檔期期間內哪一天（yyyy-MM）表現最佳（以月為單位近似）
-  const win = winBuilder(y);
-  const monthKey = (d: Date) => format(d,'yyyy-MM');
-  const targetMonths = new Set([monthKey(win.s), monthKey(win.e)]);
-  const best = monthlyAll
-    .filter(m => targetMonths.has(m.yyyymm))
-    .slice(0)
-    .sort((a,b)=> b.revenue - a.revenue)[0];
-
-  return (
-    <div className="rounded-2xl border border-slate-200 p-4 shadow-sm">
-      <h3 className="text-sm font-semibold text-slate-700 mb-2">{title}</h3>
-      <div className="space-y-2 text-sm text-slate-700">
-        <div>
-          <div className="font-medium text-slate-600 mb-1">建議 Bundle（依 Lift）</div>
-          {bundles.length ? (
-            <ul className="list-disc pl-5 space-y-1">
-              {bundles.map((b,i)=><li key={i}>{b}</li>)}
-            </ul>
-          ) : <div className="text-slate-400">暫無關聯規則可用</div>}
-        </div>
-        <div>
-          <div className="font-medium text-slate-600 mb-1">建議主推月份</div>
-          {best ? (
-            <div>去年同期最強月份：<b>{best.yyyymm}</b>（以當月歷史營收評估）</div>
-          ) : <div className="text-slate-400">資料不足，無法判定</div>}
-        </div>
-      </div>
-      <p className="text-xs text-slate-500 mt-3">＊時間粒度若要精確到日/時段，可在資料中加入更細緻的時間欄位再計算。</p>
-    </div>
-  );
-}
-
-/* ==================== 工具 ==================== */
-function formatCurrency(n: number) {
-  return new Intl.NumberFormat('zh-TW', { style: 'currency', currency: 'TWD', maximumFractionDigits: 0 }).format(n ?? 0);
-}
-function downloadCsv(name: string, rows: Record<string, any>[]) {
-  if (!rows.length) return;
-  const headers = Object.keys(rows[0]);
-  const body = rows.map(r => headers.map(h => `"${String(r[h] ?? '').replace(/"/g, '""')}"`).join(','));
-  const csv = [headers.join(','), ...body].join('\n');
-  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8;' }));
-  const a = document.createElement('a'); a.href = url; a.download = name; a.click(); URL.revokeObjectURL(url);
-}
-function labelOf(x: string){ return x==='high'?'高價值':x==='mid'?'中價值':'低價值'; }
+                <stop offset="100%" stopColor

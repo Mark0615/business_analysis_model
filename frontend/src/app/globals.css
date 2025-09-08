@@ -1,5 +1,6 @@
 @import "tailwindcss";
 
+/* 亮/暗主題色 */
 :root {
   --background: #ffffff;
   --foreground: #171717;
@@ -19,8 +20,17 @@
   }
 }
 
+/* ✅ 加入常見中文字型，避免亂碼方塊/ fallback 太醜 */
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family:
+    "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", "Heiti TC",
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto",
+    "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+}
+
+/* 讓 Recharts/Canvas 等文字也承襲字型 */
+.recharts-text {
+  font-family: inherit;
 }
