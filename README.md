@@ -29,15 +29,15 @@
 
 ## 📂 Project Structure
 repo-root/
-├─ backend/
-│ ├─ main.py # FastAPI App (含 /analyze, /health)
-│ ├─ requirements.txt
-│ └─ ... # 分析/模型相關模組
-├─ frontend/
-│ ├─ src/app/page.tsx # 主頁 UI 與分析觸發
-│ ├─ next.config.ts
-│ ├─ package.json
-│ └─ ...
-├─ data_set/ # 本機資料（.gitignore 排除）
-├─ .gitignore
-└─ README.md
+- backend/
+-- main.py # FastAPI App (含 /analyze, /health)
+-- requirements.txt
+-- 分析/模型相關模組
+─ frontend/
+-- src/app/page.tsx # 主頁 UI 與分析觸發
+-- next.config.ts
+-- package.json
+-- ...
+- data_set/ # 本機資料（.gitignore 排除）
+-- .gitignore
+-- README.md
