@@ -3,9 +3,8 @@
 上傳銷售 CSV，一鍵得到趨勢、客群（RFM × KMeans）、商品分析與關聯規則洞察。  
 前端採 **Next.js**（Cloudflare Pages），後端採 **FastAPI**（Render）。
 
-- **Demo（Frontend）**: <https://business-analysis-model.pages.dev/>  ← 換成你的正式網址
-- **API（Backend）**: <https://business-analysis-model-backend.onrender.com/>  ← 只做參考，不需直接開放給使用者
-
+- **Demo（Frontend）**: <https://business-analysis-model.pages.dev/>
+- 
 ---
 
 ## ✨ Features
@@ -14,7 +13,6 @@
 - Data Summary：總營收、訂單數、客戶數、客單價、月營收趨勢
 - Customer Analysis：RFM 計算、KMeans 分群、各群消費頻次與平均客單
 - Product Analysis：暢銷 Top/折扣占比、地區分析（依你資料而定）
-- （可選）關聯規則分析與診斷訊息
 - 完整 CORS、環境變數化 API 位址；支援本機/雲端一致配置
 
 ---
