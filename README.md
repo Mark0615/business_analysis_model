@@ -4,12 +4,12 @@
 前端採 **Next.js**（Cloudflare Pages），後端採 **FastAPI**（Render）。
 
 - **Demo（Frontend）**: <https://business-analysis-model.pages.dev/>
-- 
+
 ---
 
 ## ✨ Features
 
-- CSV 上傳（自動辨識常見欄位）
+- CSV 上傳（自動辨識常見欄位，data, product_name, revenue 為必填）
 - Data Summary：總營收、訂單數、客戶數、客單價、月營收趨勢
 - Customer Analysis：RFM 計算、KMeans 分群、各群消費頻次與平均客單
 - Product Analysis：暢銷 Top/折扣占比、地區分析（依你資料而定）
