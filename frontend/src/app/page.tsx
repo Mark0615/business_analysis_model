@@ -1034,7 +1034,15 @@ function TabBtn({ active, onClick, children }:{active:boolean; onClick:()=>void;
 }
 
 // KPI + 迷你趨勢
-function KpiCardWithSpark({ title, value, data }:{ title:string; value:string; data:{x:string,y:number}[] }) {
+function KpiCardWithSpark({
+  title,
+  value,
+  data,
+}: {
+  title: string;
+  value: string;
+  data: { x: string; y: number }[];
+}) {
   return (
     <div className="rounded-2xl border border-slate-200 p-4 bg-white shadow-sm">
       <div className="text-xs text-slate-500 mb-1">{title}</div>
@@ -1045,4 +1053,21 @@ function KpiCardWithSpark({ title, value, data }:{ title:string; value:string; d
             <defs>
               <linearGradient id="sparkGrad" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stopColor="#60a5fa" stopOpacity={0.5} />
-                <stop offset="100%" stopColor
+                <stop offset="100%" stopColor="#60a5fa" stopOpacity={0.05} />
+              </linearGradient>
+            </defs>
+            <XAxis dataKey="x" hide />
+            <YAxis hide />
+            <Area
+              type="monotone"
+              dataKey="y"
+              stroke="#60a5fa"
+              strokeWidth={1}
+              fill="url(#sparkGrad)"
+            />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
