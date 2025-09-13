@@ -1,21 +1,19 @@
-data_set/
-*.csv
-*.parquet
-*.zip
-data_set/
-*.csv
-*.parquet
-*.zip
 
-# macOS
 .DS_Store
-
-# Python
-__pycache__/
-*.py[cod]
-.DS_Store
-*.csv
-*.parquet
-*.zip
-.env*
+*.swp
+.vscode/
+.idea/
+frontend/node_modules/
 frontend/.next/
+frontend/.vercel/
+frontend/out/
+frontend/.env.local
+frontend/.env*
+backend/.venv/
+backend/__pycache__/
+backend/.pytest_cache/
+backend/*.pyc
+backend/.env
+dist/
+build/
+*.pptx
