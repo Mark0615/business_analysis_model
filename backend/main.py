@@ -18,7 +18,6 @@ from pptx.util import Inches, Pt
 from pptx.enum.text import PP_ALIGN
 from dotenv import load_dotenv
 
-# ---------- env / settings ----------
 load_dotenv()
 
 OPENAI_MODEL = os.getenv("DECK_MODEL", "gpt-4o-mini")
@@ -69,7 +68,6 @@ def _lazy_import_ml():
     from mlxtend.frequent_patterns import apriori, association_rules
     return KMeans, TransactionEncoder, apriori, association_rules
 
-# ---------- app & middleware ----------
 app = FastAPI()
 
 app.add_middleware(
@@ -128,7 +126,6 @@ async def size_guard(request: Request, call_next):
                 return JSONResponse({"error": "request_too_large", "limit_bytes": REQUEST_MAX_BYTES}, status_code=413)
     return await call_next(request)
 
-# ---------- models ----------
 class Row(BaseModel):
     date: str
     product_name: str
@@ -151,7 +148,6 @@ class DeckIn(BaseModel):
     title: Optional[str] = "Business Product Analysis"
     insights: Dict[str, Any]
 
-# ---------- deck helpers ----------
 def _pick_for_prompt(ins: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "kpis": {"mom": ins.get("mom"), "wow": ins.get("wow")},
@@ -213,7 +209,7 @@ def _ask_llm_for_outline(title: str, payload: Dict[str, Any]) -> List[Dict[str, 
 
     raw = ""
     try:
-        # 優先：新 SDK（responses + json_schema）
+        # 優先: SDK（responses + json_schema）
         try:
             resp = client.responses.create(
                 model=OPENAI_MODEL,
@@ -240,7 +236,6 @@ def _ask_llm_for_outline(title: str, payload: Dict[str, Any]) -> List[Dict[str, 
             )
             raw = (comp.choices[0].message.content or "").strip()
 
-        # 嘗試把純文字收斂成 JSON
         s = raw.strip()
         if not s.startswith("{"):
             i = s.find("{")
@@ -264,7 +259,6 @@ def _ask_llm_for_outline(title: str, payload: Dict[str, Any]) -> List[Dict[str, 
     except Exception as e:
         logging.warning("LLM outline failed, fallback used: %s", e)
 
-    # 保底，避免 502
     return [
         {"title": title, "bullets": ["資料摘要", "趨勢與商品重點", "後續行動建議"]},
         {"title": "關鍵洞察摘要", "bullets": ["MoM/WoW 變化", "Top 產品", "RFM 概況"]},
@@ -297,7 +291,6 @@ def _add_trend_slide(prs, monthly):
         if img.getbuffer().nbytes > 0:
             slide.shapes.add_picture(img, Inches(0.6), Inches(1.6), width=Inches(9.2))
     except Exception:
-        # 失敗就不插圖，避免整個請求崩潰
         pass
     return slide
 
@@ -369,7 +362,6 @@ def _add_assoc_slide(prs, rules: List[Dict[str, Any]]):
     return slide
 
 
-# ---------- health ----------
 @app.get("/ping")
 def ping():
     return {"status": "ok", "uptime_sec": int(time.time() - START_TS)}
@@ -378,7 +370,6 @@ def ping():
 def healthz():
     return "ok"
 
-# ---------- analysis helpers ----------
 def _assoc_rules(df: pd.DataFrame) -> Tuple[list, Dict[str, Any]]:
     try:
         KMeans, TransactionEncoder, apriori, association_rules = _lazy_import_ml()
@@ -600,7 +591,6 @@ def generate_deck(in_: DeckIn):
         rules = in_.insights.get("assoc_rules") or []
         _add_assoc_slide(prs, rules)
 
-        # LLM 要求嚴格時，如果解析不到 slides 就直接回 502
         if DECK_STRICT_LLM and (not outline or not isinstance(outline, list)):
             raise HTTPException(status_code=502, detail={"error":"llm_invalid_output","message":"model did not return valid slides"})
 
