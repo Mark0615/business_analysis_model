@@ -1,51 +1,40 @@
 # E-Commerce Product Business Analytics Model 
-Upload your sales CSV and instantly get insights on trends, customer segments (RFM × KMeans), product analysis, and association rules.
-Frontend built with **Next.js** (Cloudflare Pages), backend built with **FastAPI** (Render).
-
-- **Demo（Frontend）**: <https://business-analysis-model.pages.dev/>
+A one-page analytics platform that turns a CSV into real-time insights, including trends, RFM segmentation, market-basket rules, campaign audiences, and emerging products, plus one-click LLM-generated slide decks (PPTX). Frontend emphasizes UX & data cleaning, backend provides a tunable, robust analytics API.
+**Live Site** : https://business-analysis-model.pages.dev/
 
 ---
 
 ## ✨ Features
 
-- CSV 上傳（自動辨識常見欄位，data, product_name, revenue 為必填
-  CSV upload (auto-detects common fields; date, product_name, revenue are required)
-  
-- Data Summary：總營收、訂單數、客戶數、客單價、月營收趨勢
-  Data Summary: total revenue, number of orders, number of customers, average order value, monthly revenue trends
-  
-- Customer Analysis：RFM 計算、KMeans 分群、各群消費頻次與平均客單
-  Customer Analysis: RFM calculation, KMeans clustering, consumption frequency and average order value by segment
-  
-- Product Analysis：暢銷 Top/折扣占比、地區分析（依你資料而定）
-  Product Analysis: best-sellers & discount ratios, regional analysis (based on your dataset)
-  
-- 完整 CORS、環境變數化 API 位址；支援本機/雲端一致配置
-  Full CORS support, API endpoint via environment variables; consistent configuration for both local and cloud environments
+- **資料上傳與清洗，自動辨認常見欄位** | Data upload and cleansing with automated detection of common fields.
+- **清楚的資料視覺化圖表**｜Clear and intuitive data visualizations for actionable insights.
+- **快速掌握 RFM 分群名單，可下載潛在顧客名單** | Rapid generation of RFM-based customer segmentation lists, with export support for potential customer targeting.
+- **透過Apriori演算法掌握關聯商品** | Association rule mining with the Apriori algorithm to identify related products.
+- **潛力商品偵測** | Detection of potential high-performing products through data-driven analysis.
+- **一鍵產出簡報** | One-click generation of presentation-ready reports.
 
 ---
 
 ## 🧱 Tech Stack
 
-- **Frontend**: Next.js 15, React, TypeScript, Tailwind CSS
+- **Frontend**: Next.js, React, TypeScript, CSS
 - **Hosting**: Cloudflare Pages
-- **Backend**: FastAPI, Uvicorn, Python (≥3.11)
+- **Backend**: FastAPI, Uvicorn, Python
 - **ML/DS**: pandas, numpy, scikit-learn（KMeans / RFM 等）
 - **Backend Hosting**: Render
 
 ---
 
-## 📂 Project Structure
-repo-root/
-- backend/
--- main.py # FastAPI App (含 /analyze, /health)
--- requirements.txt
--- 分析/模型相關模組
-─ frontend/
--- src/app/page.tsx # 主頁 UI 與分析觸發
--- next.config.ts
--- package.json
--- ...
-- data_set/ # 本機資料（.gitignore 排除）
--- .gitignore
--- README.md
+## 📂 Work Flow
+User upload CSV → Data cleaning and visualization→ Call backend run analysis model → Return insights
+
+---
+
+## 📊 Screenshots
+Page 1 - Summary :
+<img width="1277" height="901" alt="image" src="https://github.com/user-attachments/assets/94afee19-d126-47c9-aaed-da8981b1fbd3" />
+
+Page 2 - Customer Analysis :
+<img width="1258" height="921" alt="image" src="https://github.com/user-attachments/assets/c681379d-ee4b-49e6-9554-42dc63ff9734" />
+
+
