@@ -646,7 +646,6 @@ export default function Home() {
     setDeckMsg('準備產生簡報…');
 
     try {
-      // 1) 若沒有現成的 insights，就即時呼叫 /analyze 拿一次
       let insights: any = server;
       if (!insights) {
         setDeckMsg('後端分析中…');
@@ -670,14 +669,13 @@ export default function Home() {
         insights = await resAnalyze.json();
       }
 
-      // 2) 送到 /generate_deck 產出 PPTX
       setDeckMsg('AI 規劃投影片/產出中…');
       const resDeck = await fetchWithRetry(`${API_BASE}/generate_deck`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json; charset=utf-8' },
         body: JSON.stringify({
           title: 'Business Product Analysis',
-          insights, // 後端會自己挑需要的欄位
+          insights,
         }),
       });
       if (!resDeck.ok) {
@@ -685,7 +683,6 @@ export default function Home() {
         throw new Error(`HTTP ${resDeck.status}${t ? ` ｜${t.slice(0, 200)}` : ''}`);
       }
 
-      // 3) 下載檔案
       const blob = await resDeck.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -701,8 +698,6 @@ export default function Home() {
       setDeckBusy(false);
     }
   }
-
-
 
   /* == UI == */
   return (
