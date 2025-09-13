@@ -1,69 +1,75 @@
-# main.py — Hardened FastAPI backend with CORS, limits, timeouts, and diagnostics
-import os, re, time, uuid, logging
+import re, time, uuid, logging
 import concurrent.futures as futures
-from typing import List, Optional, Dict, Any, Tuple
-
 import numpy as np
 import pandas as pd
+import io, json, os
+import matplotlib 
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+from typing import List, Optional, Dict, Any, Tuple
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from openai import OpenAI
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.enum.text import PP_ALIGN
+from dotenv import load_dotenv
 
-# ============== optional: load local .env for dev ==============
-try:
-    from dotenv import load_dotenv  # pip install python-dotenv
-    load_dotenv()
-except Exception:
-    pass
+# ---------- env / settings ----------
+load_dotenv()
 
-# ========================== Settings ===========================
+OPENAI_MODEL = os.getenv("DECK_MODEL", "gpt-4o-mini")
+DECK_MAX_SLIDES = int(os.getenv("DECK_MAX_SLIDES", "10"))
+DECK_STRICT_LLM = os.getenv("DECK_STRICT_LLM", "1").lower() in ("1","true","yes")
+
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise RuntimeError("Missing OPENAI_API_KEY. Put it in backend/.env or set an env var.")
+client = OpenAI(api_key=api_key)
+
 CORS_ORIGINS_RAW = os.getenv(
     "CORS_ORIGINS",
     "http://localhost:3000,http://127.0.0.1:3000"
 )
-
-# Starlette 的 CORSMiddleware 對萬用字元不吃 "https://*.xxx"
-# 這裡將帶 * 的項目轉成 allow_origin_regex，其它維持精確比對。
 _raw_origins = [o.strip() for o in CORS_ORIGINS_RAW.split(",") if o.strip()]
 _plain_origins = [o for o in _raw_origins if "*" not in o]
 _wildcards = [o for o in _raw_origins if "*" in o]
 if _wildcards:
-    _patterns = [re.escape(w).replace(r"\*", r"[^/]+") for w in _wildcards]
+    import re as _re
+    _patterns = [_re.escape(w).replace(r"\*", r"[^/]+") for w in _wildcards]
     CORS_ORIGIN_REGEX = r"^(?:%s)$" % "|".join(_patterns)
 else:
     CORS_ORIGIN_REGEX = None
 
-REQUEST_MAX_BYTES = int(os.getenv("REQUEST_MAX_BYTES", "10485760"))  # 10 MiB
-MAX_ROWS = int(os.getenv("MAX_ROWS", "200000"))                      # upper row limit
-ALGO_TIMEOUT_SEC = int(os.getenv("ALGO_TIMEOUT_SEC", "20"))          # per-task timeout
+REQUEST_MAX_BYTES = int(os.getenv("REQUEST_MAX_BYTES", "10485760"))
+MAX_ROWS = int(os.getenv("MAX_ROWS", "200000"))
+ALGO_TIMEOUT_SEC = int(os.getenv("ALGO_TIMEOUT_SEC", "20"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 REQUIRE_HTTPS = os.getenv("REQUIRE_HTTPS", "0").lower() in ("1", "true", "yes")
-SENTRY_DSN = os.getenv("SENTRY_DSN", "")  # optional
+SENTRY_DSN = os.getenv("SENTRY_DSN", "")
 
-# ====================== Logging / Sentry =======================
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(message)s",
 )
-
 if SENTRY_DSN:
     try:
-        import sentry_sdk  # pip install sentry-sdk
+        import sentry_sdk
         sentry_sdk.init(dsn=SENTRY_DSN, traces_sample_rate=0.05)
         logging.info("Sentry initialized")
     except Exception as e:
         logging.warning(f"Sentry init failed: {e}")
 
-# ================ Lazy ML imports (faster cold start) =========
 def _lazy_import_ml():
-    # 只在需要時才 import heavy 套件
     from sklearn.cluster import KMeans
     from mlxtend.preprocessing import TransactionEncoder
     from mlxtend.frequent_patterns import apriori, association_rules
     return KMeans, TransactionEncoder, apriori, association_rules
 
-# ======================== FastAPI app ==========================
+# ---------- app & middleware ----------
 app = FastAPI()
 
 app.add_middleware(
@@ -77,7 +83,6 @@ app.add_middleware(
 
 START_TS = time.time()
 
-# --------------------- middleware: request id / logging
 @app.middleware("http")
 async def request_context(request: Request, call_next):
     rid = request.headers.get("x-request-id") or str(uuid.uuid4())
@@ -93,7 +98,6 @@ async def request_context(request: Request, call_next):
     logging.info(f"[{rid}] {request.method} {request.url.path} -> {resp.status_code} in {dt_ms}ms")
     return resp
 
-# --------------------- middleware: HTTPS enforce
 @app.middleware("http")
 async def https_enforcer(request: Request, call_next):
     if REQUIRE_HTTPS:
@@ -102,7 +106,6 @@ async def https_enforcer(request: Request, call_next):
             return JSONResponse({"error": "https_required"}, status_code=400)
     return await call_next(request)
 
-# --------------------- middleware: security headers
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     resp = await call_next(request)
@@ -113,7 +116,6 @@ async def security_headers(request: Request, call_next):
         resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
     return resp
 
-# --------------------- middleware: request body size guard
 @app.middleware("http")
 async def size_guard(request: Request, call_next):
     if request.method in ("POST", "PUT", "PATCH"):
@@ -121,12 +123,12 @@ async def size_guard(request: Request, call_next):
         if cl and int(cl) > REQUEST_MAX_BYTES:
             return JSONResponse({"error": "request_too_large", "limit_bytes": REQUEST_MAX_BYTES}, status_code=413)
         if not cl:
-            body = await request.body()  # Starlette caches it
+            body = await request.body()
             if len(body) > REQUEST_MAX_BYTES:
                 return JSONResponse({"error": "request_too_large", "limit_bytes": REQUEST_MAX_BYTES}, status_code=413)
     return await call_next(request)
 
-# ======================== Schemas ==============================
+# ---------- models ----------
 class Row(BaseModel):
     date: str
     product_name: str
@@ -138,15 +140,236 @@ class Row(BaseModel):
     order_id: Optional[str] = None
 
 class AnalyzeIn(BaseModel):
-    rows: List[Row]  # 👈 只要 rows，別放 date_from/date_to
+    rows: List[Row]
 
 class AnalyzeAssocIn(BaseModel):
     rows: List[Row]
-    date_from: str   # 'YYYY-MM-DD'
-    date_to: str     # 'YYYY-MM-DD'
+    date_from: str
+    date_to: str
+
+class DeckIn(BaseModel):
+    title: Optional[str] = "Business Product Analysis"
+    insights: Dict[str, Any]
+
+# ---------- deck helpers ----------
+def _pick_for_prompt(ins: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "kpis": {"mom": ins.get("mom"), "wow": ins.get("wow")},
+        "monthly": (ins.get("monthly") or [])[-12:],
+        "top5_products": (ins.get("top5_products") or [])[:5],
+        "rfm_share": ins.get("rfm_share"),
+        "rfm_counts": ins.get("rfm_counts"),
+        "rfm_avg_monetary": ins.get("rfm_avg_monetary"),
+        "assoc_rules": (ins.get("assoc_rules") or [])[:3],
+        "potential_products": (ins.get("potential_products") or [])[:5],
+        "nurture_mid": (ins.get("nurture_mid") or [])[:10],
+        "nurture_low": (ins.get("nurture_low") or [])[:10],
+    }
+
+def _ask_llm_for_outline(title: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    system = (
+        "你是商業營運顧問與簡報撰寫者，使用繁體中文，語氣專業且精簡。"
+        "根據提供的分析 JSON，產出 6~12 張投影片的大綱。"
+        "每張投影片需包含 title 與 3~5 個 bullet（每個 bullet 20 字以內）。"
+        "包含：封面、整體摘要、趨勢、暢銷商品、RFM 客群洞察、關聯規則（若有）、潛力商品、行動建議與後續實施。"
+        "只輸出 JSON 物件：{\"slides\": [{\"title\": str, \"bullets\": [str, ...]}]}。不得輸出多餘文字。"
+    )
+    user = {
+        "deck_title": title,
+        "max_slides": DECK_MAX_SLIDES,
+        "insights": _pick_for_prompt(payload),
+    }
+
+    schema = {
+        "name": "deck_outline",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "slides": {
+                    "type": "array",
+                    "minItems": 6,
+                    "maxItems": DECK_MAX_SLIDES,
+                    "items": {
+                        "type": "object",
+                        "required": ["title", "bullets"],
+                        "properties": {
+                            "title":   {"type": "string", "minLength": 2, "maxLength": 60},
+                            "bullets": {"type": "array", "minItems": 3, "maxItems": 5,
+                                        "items": {"type": "string", "minLength": 2, "maxLength": 40}}
+                        }
+                    }
+                }
+            },
+            "required": ["slides"],
+            "additionalProperties": False
+        },
+        "strict": True,
+    }
+
+    msgs = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+    ]
+
+    raw = ""
+    try:
+        # 優先：新 SDK（responses + json_schema）
+        try:
+            resp = client.responses.create(
+                model=OPENAI_MODEL,
+                temperature=0.2,
+                max_output_tokens=1200,
+                response_format={"type": "json_schema", "json_schema": schema},
+                input=msgs,
+            )
+            raw = resp.output_text or ""
+        except TypeError:
+            # 舊 SDK（沒有 response_format）：退回純文字
+            resp = client.responses.create(
+                model=OPENAI_MODEL,
+                temperature=0.2,
+                input=msgs,
+            )
+            raw = (resp.output_text or "").strip()
+        except AttributeError:
+            # 更舊（沒有 responses API）：退到 chat.completions
+            comp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                temperature=0.2,
+                messages=msgs,
+            )
+            raw = (comp.choices[0].message.content or "").strip()
+
+        # 嘗試把純文字收斂成 JSON
+        s = raw.strip()
+        if not s.startswith("{"):
+            i = s.find("{")
+            if i >= 0:
+                s = s[i:]
+        if "}" in s:
+            s = s[: s.rfind("}") + 1]
+
+        obj = json.loads(s)
+        slides = obj.get("slides") or obj
+        cleaned: List[Dict[str, Any]] = []
+        if isinstance(slides, list):
+            for item in slides[:DECK_MAX_SLIDES]:
+                if not isinstance(item, dict): continue
+                t = str(item.get("title") or "").strip()[:60]
+                bs = [str(b)[:40] for b in (item.get("bullets") or [])][:5]
+                if t and bs: cleaned.append({"title": t, "bullets": bs})
+        if cleaned:
+            return cleaned
+        raise ValueError("model did not return valid slides")
+    except Exception as e:
+        logging.warning("LLM outline failed, fallback used: %s", e)
+
+    # 保底，避免 502
+    return [
+        {"title": title, "bullets": ["資料摘要", "趨勢與商品重點", "後續行動建議"]},
+        {"title": "關鍵洞察摘要", "bullets": ["MoM/WoW 變化", "Top 產品", "RFM 概況"]},
+    ]
+
+def _build_trend_image(monthly: List[Dict[str, Any]]) -> io.BytesIO:
+    buf = io.BytesIO()
+    if not monthly:
+        return buf
+    try:
+        xs = [m["yyyymm"] for m in monthly]
+        ys = [m["revenue"] for m in monthly]
+        plt.figure(figsize=(6, 3.2), dpi=160)
+        plt.plot(xs, ys, linewidth=2)
+        plt.fill_between(xs, ys, alpha=0.15)
+        plt.xticks(rotation=45, ha="right", fontsize=8)
+        plt.ylabel("Revenue")
+        plt.tight_layout()
+        plt.savefig(buf, format="png")
+    finally:
+        plt.close('all')
+    buf.seek(0)
+    return buf
+
+def _add_trend_slide(prs, monthly):
+    slide = prs.slides.add_slide(prs.slide_layouts[5])  # Title Only
+    slide.shapes.title.text = "每月營收趨勢（近一年）"
+    try:
+        img = _build_trend_image(monthly)
+        if img.getbuffer().nbytes > 0:
+            slide.shapes.add_picture(img, Inches(0.6), Inches(1.6), width=Inches(9.2))
+    except Exception:
+        # 失敗就不插圖，避免整個請求崩潰
+        pass
+    return slide
+
+def _build_top5_chart(top5: List[Dict[str, Any]]) -> io.BytesIO:
+    buf = io.BytesIO()
+    if not top5: return buf
+    names = [x["product_name"] for x in top5]
+    vals  = [x["revenue"] for x in top5]
+    plt.figure(figsize=(6,3.2), dpi=160)
+    plt.barh(names[::-1], vals[::-1])
+    plt.tight_layout()
+    plt.savefig(buf, format="png"); plt.close(); buf.seek(0)
+    return buf
+
+def _build_rfm_donut(share: Dict[str, float]) -> io.BytesIO:
+    buf = io.BytesIO()
+    if not share: return buf
+    labels = ["高價值","中價值","低價值"]
+    sizes  = [share.get("high",0), share.get("mid",0), share.get("low",0)]
+    plt.figure(figsize=(6,3.2), dpi=160)
+    wedges, _ = plt.pie(sizes, startangle=140, wedgeprops=dict(width=0.45))
+    plt.legend(wedges, labels, loc="center left", bbox_to_anchor=(1,0.5))
+    plt.tight_layout()
+    plt.savefig(buf, format="png"); plt.close(); buf.seek(0)
+    return buf
+
+def _add_bullet_slide(prs, title, bullets):
+    layout = prs.slide_layouts[1]
+    slide = prs.slides.add_slide(layout)
+    slide.shapes.title.text = title
+    tf = slide.shapes.placeholders[1].text_frame
+    tf.clear()
+    for b in bullets[:5]:
+        p = tf.add_paragraph()
+        p.text = str(b)
+        p.level = 0
+    return slide
+
+def _add_cover(prs, title):
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
+    slide.shapes.title.text = title
+    st = slide.shapes.title.text_frame.paragraphs[0]
+    st.font.size = Pt(40)
+    st.alignment = PP_ALIGN.LEFT
+    sub = slide.placeholders[1]
+    sub.text = "Automated deck"
+    return slide
+
+def _add_image_slide(prs, title: str, img_buf: io.BytesIO):
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    slide.shapes.title.text = title
+    if img_buf.getbuffer().nbytes > 0:
+        slide.shapes.add_picture(img_buf, Inches(0.6), Inches(1.6), width=Inches(9.2))
+    return slide
+
+def _add_assoc_slide(prs, rules: List[Dict[str, Any]]):
+    slide = prs.slides.add_slide(prs.slide_layouts[1])
+    slide.shapes.title.text = "關聯規則（Top）"
+    tf = slide.shapes.placeholders[1].text_frame
+    tf.clear()
+    show = rules[:5] if rules else []
+    if not show:
+        p = tf.add_paragraph(); p.text = "暫無顯著規則"; p.level = 0
+        return slide
+    for r in show:
+        p = tf.add_paragraph()
+        p.text = f"{' + '.join(r['antecedents'])} → {' + '.join(r['consequents'])}｜Lift {r['lift']:.2f}｜Conf {(r['confidence']*100):.1f}%"
+        p.level = 0
+    return slide
 
 
-# ======================== Health ===============================
+# ---------- health ----------
 @app.get("/ping")
 def ping():
     return {"status": "ok", "uptime_sec": int(time.time() - START_TS)}
@@ -155,16 +378,13 @@ def ping():
 def healthz():
     return "ok"
 
-# ======================== Helpers ==============================
+# ---------- analysis helpers ----------
 def _assoc_rules(df: pd.DataFrame) -> Tuple[list, Dict[str, Any]]:
-    """Apriori + 連帶規則（帶診斷）。"""
     try:
         KMeans, TransactionEncoder, apriori, association_rules = _lazy_import_ml()
     except Exception:
-        # 套件缺少時直接回診斷
         return [], {"ok": False, "baskets_total": 0, "baskets_valid": 0, "reason": "algorithm_error"}
 
-    # 組籃子鍵
     cust_key = df.get("customer_email", pd.Series([""] * len(df))).fillna("").str.strip()
     if not (cust_key.str.len() > 0).any():
         cust_key = df.get("customer_name", pd.Series([""] * len(df))).fillna("").str.strip()
@@ -215,13 +435,11 @@ def _assoc_rules(df: pd.DataFrame) -> Tuple[list, Dict[str, Any]]:
     return assoc_rules_out, diag
 
 def _rfm(df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, int], Dict[str, float], Dict[str, list], Dict[str, Any]]:
-    """RFM 分群（優先 KMeans；fallback 改用 R/F/M 加權分數 + 25/75 分位），並輸出加溫名單。"""
     try:
         KMeans, *_ = _lazy_import_ml()
     except Exception:
         KMeans = None
 
-    # ====== 建客戶鍵 / 訂單鍵 ======
     cust_key = df.get("customer_email", pd.Series([""] * len(df))).fillna("").str.strip()
     if not (cust_key.str.len() > 0).any():
         cust_key = df.get("customer_name", pd.Series([""] * len(df))).fillna("").str.strip()
@@ -233,7 +451,6 @@ def _rfm(df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, int], Dict[str, 
         df["basket_id"] = df["customer_id"].fillna("") + "_" + df["date"].dt.strftime("%Y-%m-%d")
     df["order_key"] = df["basket_id"]
 
-    # ====== 客戶彙總 ======
     cust = (df.groupby("customer_id")
               .agg(last_date=("date", "max"),
                    orders=("order_key", pd.Series.nunique),
@@ -249,20 +466,16 @@ def _rfm(df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, int], Dict[str, 
     rfm_avg_monetary = {"low": 0.0, "mid": 0.0, "high": 0.0}
     nurture: Dict[str, list] = {"mid": [], "low": []}
     reason = None
-    method = None  # 新增：告知這次用 kmeans 或 quantile
 
     if len(cust) >= 3:
         max_date = df["date"].max()
-        cust["recency"] = (max_date - cust["last_date"]).dt.days.astype(float).clip(lower=0)
+        cust["recency"] = (max_date - cust["last_date"]).dt.days
 
-        # ====== 先試 KMeans ======
         use_quantile = False
         if KMeans is not None:
             try:
-                # 特徵標準化
                 X = cust[["recency", "orders", "monetary"]].astype(float)
                 X = (X - X.mean()) / (X.std(ddof=0) + 1e-9)
-
                 km = KMeans(n_clusters=3, n_init=10, random_state=42)
                 cust["segment"] = km.fit_predict(X)
 
@@ -270,46 +483,23 @@ def _rfm(df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, int], Dict[str, 
                 if (len(counts) < 3) or (counts.min() <= 1):
                     use_quantile = True
                 else:
-                    # 依各群平均 monetary 排序 → 指派 low/mid/high
-                    rank = (cust.groupby("segment")["monetary"]
-                              .mean().sort_values().reset_index())
+                    rank = (cust.groupby("segment")["monetary"].mean().sort_values().reset_index())
                     rank["level"] = ["low", "mid", "high"]
                     m = dict(zip(rank["segment"], rank["level"]))
                     cust["level"] = cust["segment"].map(m)
-                    method = "kmeans"
             except Exception:
                 use_quantile = True
         else:
             use_quantile = True
 
-        # ====== 退回：用 R/F/M 加權分數 + 25/75 分位（避免硬三等份，且考慮 R/F/M） ======
         if use_quantile:
-            # rank 到 0~1：Recency 越小越好 → 用負號反向
-            def to_rank(series: pd.Series, reverse: bool = False) -> pd.Series:
-                s = series.astype(float)
-                if reverse: s = -s
-                order = s.rank(method="average", pct=True)  # 0~1
-                return order
-
-            r_rank = to_rank(cust["recency"], reverse=True)   # recency 越新越高分
-            f_rank = to_rank(cust["orders"],  reverse=False)
-            m_rank = to_rank(cust["monetary"], reverse=False)
-
-            score = 0.2 * r_rank + 0.3 * f_rank + 0.5 * m_rank
-            cust["rfm_score"] = score
-
-            t1 = score.quantile(0.25)  # 25%
-            t2 = score.quantile(0.75)  # 75%
-
-            def lvl_sc(s):
-                if s <= t1: return "low"
-                elif s <= t2: return "mid"
+            q1, q2 = cust["monetary"].quantile([1/3, 2/3])
+            def lvl(v):
+                if v <= q1: return "low"
+                elif v <= q2: return "mid"
                 else: return "high"
+            cust["level"] = cust["monetary"].apply(lvl)
 
-            cust["level"] = cust["rfm_score"].apply(lvl_sc)
-            method = "quantile"
-
-        # ====== 統計輸出 ======
         levels = ["low", "mid", "high"]
 
         cnt_map = cust["level"].value_counts().to_dict()
@@ -322,7 +512,6 @@ def _rfm(df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, int], Dict[str, 
         share_sum_map = {lv: float(cust.loc[cust["level"] == lv, "monetary"].sum()) for lv in levels}
         rfm_share = {lv: (round(share_sum_map.get(lv, 0.0) / total_rev, 4) if total_rev > 0 else 0.0) for lv in levels}
 
-        # ====== 加溫名單（mid/low） ======
         r_th = 45
         m_th_mid = cust.loc[cust["level"] == "mid", "monetary"].median() if (cust["level"] == "mid").any() else 0.0
         m_th_low = cust.loc[cust["level"] == "low", "monetary"].median() if (cust["level"] == "low").any() else 0.0
@@ -342,25 +531,20 @@ def _rfm(df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, int], Dict[str, 
 
         nurture["mid"] = build_list(cust[cust["level"] == "mid"], m_th_mid)
         nurture["low"] = build_list(cust[cust["level"] == "low"], m_th_low)
-
     else:
         reason = "no_customer_key_or_too_few"
-        method = "na"
 
     diag = {
         "ok": customers_used >= 3,
         "customers_total": customers_total,
         "customers_used": customers_used,
-        "reason": reason,
-        "method": method,  # 新增：kmeans / quantile / na
+        "reason": reason
     }
     return rfm_share, rfm_counts, rfm_avg_monetary, nurture, diag
-
 
 def _potential_products(df: pd.DataFrame,
                         top5_names: set,
                         monthly_ordered: pd.DataFrame) -> list:
-    """最後三個月營收加總、最近月 MoM > 20% 的上升產品，排除 Top5。"""
     out = []
     df["yyyymm"] = df["date"].dt.to_period("M").astype(str)
     prod_m = (df.groupby(["product_name", "yyyymm"], as_index=False)["revenue"].sum()
@@ -371,7 +555,6 @@ def _potential_products(df: pd.DataFrame,
         if not recent.empty:
             g = recent.pivot(index="product_name", columns="yyyymm", values="revenue").fillna(0.0)
             if g.shape[1] == 3:
-                # 最後一個月相對倒數第二個月
                 g["mom_last"] = (g.iloc[:, 2] - g.iloc[:, 1]) / (g.iloc[:, 1].replace(0, np.nan))
                 g["sum3"] = g.sum(axis=1)
                 cand = g[(g["mom_last"] > 0.2) & (~g.index.isin(top5_names))]
@@ -384,7 +567,61 @@ def _potential_products(df: pd.DataFrame,
                     })
     return out
 
-# ========================= API ================================
+# ---------- endpoints ----------
+@app.post("/generate_deck",
+    responses={
+        200: {
+            "content": {
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation": {}
+            },
+            "description": "Generate PPTX file."
+        }
+    },
+)
+def generate_deck(in_: DeckIn):
+    try:
+        outline = _ask_llm_for_outline(in_.title or "Business Product Analysis", in_.insights)
+
+        prs = Presentation()
+        _add_cover(prs, in_.title or "Business Product Analysis")
+
+        monthly = (in_.insights.get("monthly") or [])[-12:]
+        if monthly:
+            _add_trend_slide(prs, monthly)
+
+        top5 = in_.insights.get("top5_products") or []
+        if top5:
+            _add_image_slide(prs, "暢銷商品 Top 5（營收）", _build_top5_chart(top5))
+
+        rfm_share = in_.insights.get("rfm_share") or {}
+        if rfm_share:
+            _add_image_slide(prs, "RFM 客群佔比", _build_rfm_donut(rfm_share))
+
+        rules = in_.insights.get("assoc_rules") or []
+        _add_assoc_slide(prs, rules)
+
+        # LLM 要求嚴格時，如果解析不到 slides 就直接回 502
+        if DECK_STRICT_LLM and (not outline or not isinstance(outline, list)):
+            raise HTTPException(status_code=502, detail={"error":"llm_invalid_output","message":"model did not return valid slides"})
+
+        for s in outline or []:
+            _add_bullet_slide(prs, s.get("title") or "Untitled", s.get("bullets") or [])
+
+        out = io.BytesIO()
+        prs.save(out)
+        out.seek(0)
+        fn = f"business_deck_{int(time.time())}.pptx"
+        return StreamingResponse(
+            out,
+            media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            headers={"Content-Disposition": f'attachment; filename="{fn}"', "X-Deck-Source": "llm"}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("generate_deck failed")
+        raise HTTPException(status_code=502, detail={"error": "deck_failed", "message": str(e)[:300]})
+
 @app.post("/assoc_window")
 def assoc_window(payload: AnalyzeAssocIn, request: Request):
     n = len(payload.rows or [])
@@ -426,7 +663,6 @@ def assoc_window(payload: AnalyzeAssocIn, request: Request):
 async def analyze(payload: AnalyzeIn, request: Request):
     rid = getattr(request.state, "rid", "-")
 
-    # Guard: row count
     n = len(payload.rows or [])
     if n == 0:
         return {"error": "no_rows",
@@ -434,10 +670,8 @@ async def analyze(payload: AnalyzeIn, request: Request):
     if n > MAX_ROWS:
         raise HTTPException(status_code=422, detail={"error": "too_many_rows", "max_rows": MAX_ROWS, "got": n})
 
-    # Build DataFrame + clean
     df = pd.DataFrame([r.dict() for r in payload.rows])
 
-    # Required fields
     required_cols = ["date", "product_name", "revenue"]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
@@ -453,7 +687,6 @@ async def analyze(payload: AnalyzeIn, request: Request):
         return {"error": "invalid_required_values",
                 "diagnostics": {"required": {"ok": False, "reason": "all_rows_invalid"}}}
 
-    # Top5 / Monthly / MoM / WoW
     top5_df = (df.groupby("product_name", as_index=False)["revenue"].sum()
                  .sort_values("revenue", ascending=False).head(5))
     top5 = top5_df.to_dict(orient="records")
@@ -472,7 +705,6 @@ async def analyze(payload: AnalyzeIn, request: Request):
     r2 = df.loc[(df["date"] >= last_day - pd.Timedelta(days=6)) & (df["date"] <= last_day), "revenue"].sum()
     wow = None if r1 == 0 else (r2 - r1) / r1
 
-    # Assoc + RFM with timeouts（並行）
     assoc_rules, assoc_diag = [], {"ok": False, "reason": "timeout", "baskets_total": 0, "baskets_valid": 0}
     rfm_share = {"low": 0.0, "mid": 0.0, "high": 0.0}
     rfm_counts = {"low": 0, "mid": 0, "high": 0}
@@ -510,15 +742,9 @@ async def analyze(payload: AnalyzeIn, request: Request):
         "rfm_share": rfm_share,
         "rfm_counts": rfm_counts,
         "rfm_avg_monetary": rfm_avg_monetary,
-        "nurture_list": (nurture_mid + nurture_low),  # 舊前端相容
+        "nurture_list": (nurture_mid + nurture_low),
         "nurture_mid": nurture_mid,
         "nurture_low": nurture_low,
         "potential_products": potential_products,
         "diagnostics": {"assoc": assoc_diag, "rfm": rfm_diag, "required": {"ok": True}},
     }
-
-
-# 可本機測試時啟動（Render/Cloud Run 不需要）
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run("main:app", host="0.0.0.0", port=8000, log_level="info")

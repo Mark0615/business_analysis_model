@@ -5,3 +5,7 @@ numpy
 scikit-learn
 mlxtend
 python-dotenv
+sentry-sdk
+openai>=1.40.0
+python-pptx
+matplotlib

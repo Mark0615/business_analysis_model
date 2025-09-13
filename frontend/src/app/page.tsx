@@ -11,7 +11,6 @@ import {
   subMonths, subDays, startOfDay, endOfDay
 } from 'date-fns';
 
-/* ==================== 型別 ==================== */
 type RawRow = Record<string, string>;
 type Row = {
   date: string;
@@ -23,7 +22,6 @@ type Row = {
   customer_email?: string;
   order_id?: string;
 
-  // 供折扣/城市分析
   unit_price?: number | null;
   list_price?: number | null;
   discount_amount?: number | null;
@@ -52,47 +50,26 @@ type ServerInsights = {
   };
 };
 
-/* ==================== 欄位別名 & 日期/數值處理 ==================== */
+/* === 欄位 & 數值處理 === */
 export const REQUIRED = ['date','product_name','revenue'] as const;
 
-// 英/中常見別名
 export const ALIASES: Record<string, string[]> = {
-  /* 必填 */
-  date: [
-    'date','order date','invoice date','dt','order_date','invoice_date',
-    '日期','訂單日期','交易日期','銷售日期'
-  ],
-  product_name: [
-    'product_name','product name','product','item','product line','sku name','sku','item name','lineitem name',
-    '商品名稱','產品名稱','品名','商品','項目','品項'
-  ],
-  revenue: [
-    'revenue','sales','total','amount','sales amount','total price','gross sales','gross income','line total','extended price','subtotal',
-    '營收','金額','成交金額','銷售金額','實收','應收','訂單金額','總額','付款金額'
-  ],
+  date: ['date','order date','invoice date','dt','order_date','invoice_date','日期','訂單日期','交易日期','銷售日期'],
+  product_name: ['product_name','product name','product','item','product line','sku name','sku','item name','lineitem name','商品名稱','產品名稱','品名','商品','項目','品項'],
+  revenue: ['revenue','sales','total','amount','sales amount','total price','gross sales','gross income','line total','extended price','subtotal','營收','金額','成交金額','銷售金額','實收','應收','訂單金額','總額','付款金額'],
 
-  /* 選填 */
-  product_category: [
-    'product_category','category','product line','lineitem_category','cat','dept','department',
-    '商品類別','類別','分類','部門'
-  ],
-  quantity: [
-    'quantity','qty','units','count','quantity ordered','order qty','order quantity','lineitem quantity',
-    '數量','件數','購買數','購買數量'
-  ],
+  product_category: ['product_category','category','product line','lineitem_category','cat','dept','department','商品類別','類別','分類','部門'],
+  quantity: ['quantity','qty','units','count','quantity ordered','order qty','order quantity','lineitem quantity','數量','件數','購買數','購買數量'],
 
-  // 單價/原價/折扣
   unit_price: ['lineitem price','line item price','unit price','price','sale price','單價','成交單價'],
   list_price: ['compare at price','list price','original price','msrp','原價','標價'],
   discount_amount: ['discount','discount amount','lineitem discount','promotion discount','promo discount','折扣','折扣金額'],
   coupon_code: ['coupon','coupon code','promo code','promotion code','優惠碼','折扣碼'],
 
-  // 客戶 & 訂單鍵
   customer_name: ['customer_name','name','customer','customer name','buyer','client name','客戶姓名','顧客姓名','買家'],
   customer_email: ['customer_email','email','e-mail','customer email','buyer email','電子郵件','email信箱','信箱'],
   order_id: ['order_id','order number','invoice id','order id','invoice','order_no','order-no','訂單編號','訂單號'],
 
-  // 城市
   shipping_city: ['shipping city','ship city','city','shipping address city','recipient city','配送城市','收件城市','城市']
 };
 
@@ -137,7 +114,6 @@ function toNumber(x: any) {
   return Number.isFinite(n) ? (neg ? -n : n) : 0;
 }
 
-/* === 轉換一列 === */
 function normalizeRow(r: RawRow): Row | null {
   const iso = toISODate(pick(r, 'date'));
   const normMap = Object.fromEntries(Object.entries(r).map(([k, v]) => [k.replace(/^\uFEFF/, '').toLowerCase().trim(), v]));
@@ -199,7 +175,7 @@ function normalizeRow(r: RawRow): Row | null {
   };
 }
 
-/* ==================== 主頁 ==================== */
+/* ===== 主頁 ===== */
 type Tab = 'summary' | 'customers' | 'products';
 
 export default function Home() {
@@ -216,22 +192,20 @@ export default function Home() {
   const [assoc618, setAssoc618] = useState<AssocRule[] | null>(null);
   const [serverNote, setServerNote] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('summary');
+  const [deckBusy, setDeckBusy] = useState(false);
+  const [deckMsg, setDeckMsg] = useState<string | null>(null);
 
-  // === 讀 CSV（UTF-8 → BIG5 fallback）+ 自動呼叫後端 ===
   const onFile = async (f: File) => {
     setFileName(f.name); setServer(null); setServerNote(null); setNotice(null);
 
-    // 1) 讀進 ArrayBuffer
     const buf = await f.arrayBuffer();
 
-    // 2) 嘗試 UTF-8，若 � 太多就以 BIG5 重新解碼
     let text = new TextDecoder('utf-8', { fatal: false }).decode(buf);
     const bad = (text.match(/\uFFFD/g) || []).length;
     if (bad > text.length * 0.01) {
       try {
         text = new TextDecoder('big5').decode(buf);
       } catch {
-        // 若瀏覽器不支援 big5，就保留原文本
       }
     }
 
@@ -275,8 +249,7 @@ export default function Home() {
     });
   };
 
-  /* ========== 聚合 & 指標（共用） ========== */
-  const monthlyAll: Monthly[] = useMemo(() => {
+    const monthlyAll: Monthly[] = useMemo(() => {
     const map = new Map<string, { revenue: number; orders: number }>();
     for (const r of rows) {
       const yyyymm = format(parseISO(r.date), 'yyyy-MM');
@@ -293,7 +266,6 @@ export default function Home() {
     const wD11 = double11Window(y);
     const w618 = six18Window(y);
 
-    // 兩個並行抓
     (async () => {
       try {
         const [r1, r2] = await Promise.all([
@@ -303,7 +275,6 @@ export default function Home() {
         setAssocD11(r1);
         setAssoc618(r2);
       } catch (e: any) {
-        // 失敗就清空；不影響頁面其它區塊
         setAssocD11([]);
         setAssoc618([]);
         console.error('assoc_window failed:', e?.message || e);
@@ -372,7 +343,6 @@ export default function Home() {
       .sort((a,b)=>b.revenue-a.revenue).slice(0,5);
   }, [rows]);
 
-  // === 折扣 vs 正價：以「銷量」為主（Summary 額外） ===
   const discountTop5ByQty = useMemo(() => {
     if (!rows.length) return [];
     const m = new Map<string, { fullQty: number; discQty: number; total: number }>();
@@ -412,7 +382,6 @@ export default function Home() {
       .slice(0, 5);
   }, [rows]);
 
-  /* ========== 客戶聚合（for 下載高價值、頻次等） ========== */
   type CustAgg = { id: string; last: Date; orders: number; revenue: number };
   const customersAgg: CustAgg[] = useMemo(() => {
     if (!rows.length) return [];
@@ -431,7 +400,7 @@ export default function Home() {
     return [...map.entries()].map(([id, v]) => ({ id, last: v.last, orders: v.ordersSet.size, revenue: v.revenue }));
   }, [rows]);
 
-  // 前端近似 RFM 等級
+  // RFM 等級
   const localRfmLevels = useMemo(() => {
     if (!customersAgg.length) return new Map<string,'low'|'mid'|'high'>();
     const maxDate = rows.map(r=>parseISO(r.date)).sort((a,b)=>b.getTime()-a.getTime())[0] || new Date();
@@ -457,7 +426,7 @@ export default function Home() {
     return lv;
   }, [customersAgg, rows]);
 
-  // 平均頻次（近似）
+  // 平均頻次
   const avgFreqByLevel = useMemo(() => {
     const out = { low: 0, mid: 0, high: 0 };
     const cnt = { low: 0, mid: 0, high: 0 };
@@ -473,7 +442,7 @@ export default function Home() {
     };
   }, [customersAgg, localRfmLevels]);
 
-  // 高價值名單（前端近似）
+  // 高價值名單
   const highValueDownloadRows = useMemo(()=>{
     const arr = customersAgg
       .filter(c => (localRfmLevels.get(c.id) || 'mid') === 'high')
@@ -488,7 +457,7 @@ export default function Home() {
     return arr;
   }, [customersAgg, localRfmLevels]);
 
-  /* ========== 城市 Top10（依營收） ========== */
+  /* ===== 城市 Top10（依營收） ===== */
   const cityTop10 = useMemo(()=>{
     const m = new Map<string, number>();
     for (const r of rows) {
@@ -507,7 +476,7 @@ export default function Home() {
     return Math.min(240, Math.max(110, Math.ceil(maxLen * 8.5)));
   }, [cityTop10]);
 
-  /* ========== 檔期名單：去年雙11 / 去年黑五 / 618========== */
+  /* ===== 檔期名單：去年雙11 / 去年黑五 / 618===== */
   function getLastYearKeyDate() {
     if (!rows.length) return new Date();
     const last = rows.map(r=>parseISO(r.date)).sort((a,b)=>b.getTime()-a.getTime())[0];
@@ -615,8 +584,6 @@ export default function Home() {
     return (data?.assoc_rules ?? []) as AssocRule[];
   }
 
-
-  // ✅ 修正：送正確欄位給後端（包含 revenue，不再使用 amount）
   async function analyzeOnServer(input?: Row[]) {
     const slimRows = (input ?? rows).map(r => ({
       date: r.date,
@@ -668,7 +635,76 @@ export default function Home() {
     }
   }
 
-  /* ==================== UI ==================== */
+  /* ====== 產出簡報（下載 .pptx）====== */
+  async function downloadDeck() {
+    if (!rows.length) {
+      setNotice({ level: 'warn', msg: '請先上傳 CSV 才能產生簡報' });
+      return;
+    }
+
+    setDeckBusy(true);
+    setDeckMsg('準備產生簡報…');
+
+    try {
+      // 1) 若沒有現成的 insights，就即時呼叫 /analyze 拿一次
+      let insights: any = server;
+      if (!insights) {
+        setDeckMsg('後端分析中…');
+        const slimRows = rows.map(r => ({
+          date: r.date,
+          product_name: r.product_name,
+          revenue: r.revenue,
+          quantity: r.quantity,
+          product_category: r.product_category ?? undefined,
+          customer_name: r.customer_name ?? undefined,
+          customer_email: r.customer_email ?? undefined,
+          order_id: r.order_id ?? undefined,
+        }));
+
+        const resAnalyze = await fetchWithRetry(`${API_BASE}/analyze`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+          body: JSON.stringify({ rows: slimRows }),
+        });
+        if (!resAnalyze.ok) throw new Error(`分析失敗（HTTP ${resAnalyze.status}）`);
+        insights = await resAnalyze.json();
+      }
+
+      // 2) 送到 /generate_deck 產出 PPTX
+      setDeckMsg('AI 規劃投影片/產出中…');
+      const resDeck = await fetchWithRetry(`${API_BASE}/generate_deck`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({
+          title: 'Business Product Analysis',
+          insights, // 後端會自己挑需要的欄位
+        }),
+      });
+      if (!resDeck.ok) {
+        const t = await resDeck.text().catch(() => '');
+        throw new Error(`HTTP ${resDeck.status}${t ? ` ｜${t.slice(0, 200)}` : ''}`);
+      }
+
+      // 3) 下載檔案
+      const blob = await resDeck.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Business_Analysis_${new Date().toISOString().slice(0,10)}.pptx`;
+      a.click();
+      URL.revokeObjectURL(url);
+
+      setDeckMsg('已下載簡報');
+    } catch (e: any) {
+      setDeckMsg('產生失敗：' + (e?.message || 'unknown'));
+    } finally {
+      setDeckBusy(false);
+    }
+  }
+
+
+
+  /* == UI == */
   return (
     <>
       {/* ===== Full-bleed Hero ===== */}
@@ -688,7 +724,6 @@ export default function Home() {
         </div>
       </header>
 
-      {/* ===== 版心內容 ===== */}
       <main className="min-h-screen bg-white text-slate-800">
         <div className="max-w-7xl mx-auto px-6 md:px-8">
           {/* 上傳卡片吃進 Hero 一點 */}
@@ -707,14 +742,31 @@ export default function Home() {
             </div>
           </div>
 
-          {/* 分頁切換 */}
-          <div className="flex gap-3 mb-6">
-            <TabBtn active={tab==='summary'} onClick={()=>setTab('summary')}>Data Summary</TabBtn>
-            <TabBtn active={tab==='customers'} onClick={()=>setTab('customers')}>Customer Analysis</TabBtn>
-            <TabBtn active={tab==='products'} onClick={()=>setTab('products')}>Product Analysis</TabBtn>
+          <div className="flex items-center justify-between mb-6">
+            <div className="flex gap-3">
+              <TabBtn active={tab==='summary'}   onClick={()=>setTab('summary')}>Data Summary</TabBtn>
+              <TabBtn active={tab==='customers'} onClick={()=>setTab('customers')}>Customer Analysis</TabBtn>
+              <TabBtn active={tab==='products'}  onClick={()=>setTab('products')}>Product Analysis</TabBtn>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <button
+                onClick={downloadDeck}
+                disabled={deckBusy || rows.length === 0}
+                className={`px-4 py-2 rounded-xl border shadow-sm transition ${
+                  deckBusy || rows.length === 0
+                    ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+                    : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                }`}
+                title={rows.length === 0 ? '請先上傳資料' : '匯出 PowerPoint'}
+              >
+                {deckBusy ? '產生簡報中…' : '產出 PPT 簡報'}
+              </button>
+
+              {deckMsg && <span className="text-xs text-slate-500">{deckMsg}</span>}
+            </div>
           </div>
 
-          {/* ==================== Summary ==================== */}
           {tab==='summary' && (
             <section className="space-y-6 mb-12">
               {/* KPI */}
@@ -757,7 +809,6 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* Top5 產品 + Top5 類別 */}
               <div className="grid md:grid-cols-2 gap-6">
                 <div className="rounded-2xl border border-slate-200 p-4">
                   <h2 className="text-base font-semibold mb-2 text-slate-700">Top 5 產品（依營收）</h2>
@@ -803,7 +854,6 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* 新增：折扣 vs 正價（量） + 最仰賴折扣 Top5 */}
               <div className="grid md:grid-cols-2 gap-6">
                 <div className="rounded-2xl border border-slate-200 p-4">
                   <h2 className="text-base font-semibold mb-2 text-slate-700">前 5 暢銷（量）｜正價 vs 折扣</h2>
@@ -865,7 +915,7 @@ export default function Home() {
             </section>
           )}
 
-          {/* ==================== Customers ==================== */}
+          {/* ====== Customers ======= */}
           {tab==='customers' && (
             <section className="space-y-6 mb-12">
               {/* RFM 佔比 + 下載 */}
@@ -899,7 +949,6 @@ export default function Home() {
                 </p>
               </div>
 
-              {/* 平均金額 / 平均頻次（表格） */}
               <div className="grid md:grid-cols-2 gap-6">
                 <div className="rounded-2xl border border-slate-200 p-4 shadow-sm">
                   <h3 className="text-sm font-semibold text-slate-700 mb-2">高/中/低價值 各自平均消費金額</h3>
@@ -940,7 +989,6 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* 城市 Top10 */}
               <div className="rounded-2xl border border-slate-200 p-4 shadow-sm">
                 <h3 className="text-sm font-semibold text-slate-700 mb-2">消費最高城市 Top10（依營收）</h3>
                 <ResponsiveContainer
@@ -982,7 +1030,6 @@ export default function Home() {
                 </ResponsiveContainer>
               </div>
 
-              {/* 去年雙11 / 618名單 */}
               <div className="grid md:grid-cols-2 gap-6">
                 <CampaignCard
                   title="去年雙11消費高於個人平均的客戶（Top10）"
@@ -998,7 +1045,7 @@ export default function Home() {
             </section>
           )}
 
-          {/* ==================== Products ==================== */}
+          {/* ==== Products ==== */}
           {tab==='products' && (
             <section className="space-y-6 mb-12">
               {/* 潛力商品 */}
@@ -1023,7 +1070,6 @@ export default function Home() {
                 </table>
               </div>
 
-              {/* 關聯規則（左右欄） */}
               <div className="rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
                 <div className="grid grid-cols-12 bg-slate-50 text-slate-600 text-sm font-medium px-4 py-3">
                   <div className="col-span-5">若顧客購買</div>
@@ -1048,7 +1094,6 @@ export default function Home() {
                 )}
               </div>
 
-              {/* 建議：雙11 / 618（束合 + 檔期日） */}
               <div className="grid md:grid-cols-2 gap-6">
                 <SuggestionCard
                   title="雙11檔期建議（Bundle & 檔期）"
@@ -1068,7 +1113,6 @@ export default function Home() {
             </section>
           )}
 
-          {/* 後端診斷訊息 */}
           {serverNote && (
             <div className="mb-12 rounded-md border px-3 py-2 text-sm border-amber-300 bg-amber-50 text-amber-800">
               {serverNote}
@@ -1096,7 +1140,6 @@ export function formatCurrency(
       ...options,
     }).format(n);
   } catch {
-    // 極端情況（Intl 不可用）退回純字串
     return `${n.toLocaleString()} ${CURRENCY}`;
   }
 }
@@ -1123,7 +1166,7 @@ function downloadCsv(fileName: string, rows: any[]) {
   const blob = new Blob([lines.join('\n')], {
     type: 'text/csv;charset=utf-8;',
   });
-  if (typeof window === 'undefined') return; // 避免 SSR 觸發
+  if (typeof window === 'undefined') return; 
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -1132,7 +1175,7 @@ function downloadCsv(fileName: string, rows: any[]) {
   URL.revokeObjectURL(url);
 }
 
-/* ==================== 小元件 ==================== */
+/* ====== 小元件 ====== */
 function TabBtn({ active, onClick, children }:{active:boolean; onClick:()=>void; children:any}) {
   return (
     <button
@@ -1146,7 +1189,6 @@ function TabBtn({ active, onClick, children }:{active:boolean; onClick:()=>void;
   );
 }
 
-// KPI + 迷你趨勢
 function KpiCardWithSpark({
   title,
   value,
@@ -1184,7 +1226,6 @@ function KpiCardWithSpark({
     </div>
   );
 }
-/* == 小徽章 == */
 function Badge({ label, value }: { label: string; value: string }) {
   return (
     <span className="inline-flex items-center gap-1 rounded-full border border-slate-300 px-2 py-0.5 text-xs text-slate-600">
@@ -1193,8 +1234,6 @@ function Badge({ label, value }: { label: string; value: string }) {
     </span>
   );
 }
-
-/* == MoM / WoW 卡片 == */
 type DeltaDetail = {
   pct: number | null;
   diff: number;
@@ -1389,7 +1428,6 @@ function SuggestionCard({
         </ol>
       )}
 
-      {/* 小提示 */}
       <p className="mt-3 text-xs text-slate-500">
         建議將以上組合做成套組或加價購，並在檔期前 7~10 天暖身，檔期當週加強再行銷。
       </p>
