@@ -1,5 +1,6 @@
 # E-Commerce Product Business Analytics Model 
 A one-page analytics platform that turns a CSV into real-time insights, including trends, RFM segmentation, market-basket rules, campaign audiences, and emerging products, plus one-click LLM-generated slide decks (PPTX). Frontend emphasizes UX & data cleaning, backend provides a tunable, robust analytics API.
+
 **Live Site** : https://business-analysis-model.pages.dev/
 
 ---
